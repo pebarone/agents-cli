@@ -2,13 +2,15 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from agents_cli import AGENTS
+from agents_cli import AGENTS, procs
 from agents_cli.home import agents_home, prepend_bin_dirs
+from agents_cli.parse import ParseError
 
 
 CANDIDATES = {
@@ -84,6 +86,23 @@ def binary_name(path: str) -> str:
     return Path(path).stem.lower()
 
 
+def _windows() -> bool:
+    return os.name == "nt"
+
+
+# Characters cmd.exe interprets even inside the arguments of a .cmd/.bat shim.
+CMD_UNSAFE_CHARS = frozenset('&|<>^%!"\r\n')
+
+
+def check_cmd_shim_argv(binary: str, argv: list[str]) -> None:
+    """npm shims (codex.CMD) run through cmd.exe: refuse arguments it would reinterpret."""
+    if not _windows() or Path(binary).suffix.lower() not in (".cmd", ".bat"):
+        return
+    for arg in argv[1:]:
+        if any(ch in CMD_UNSAFE_CHARS for ch in arg):
+            raise ParseError(f"argumento inseguro para shim .cmd: {arg}")
+
+
 def build_launch(
     *,
     agent: str,
@@ -125,7 +144,7 @@ def build_launch(
         "gemini": _gemini,
         "codex": _codex,
     }[agent]
-    return builder(
+    launch = builder(
         binary=binary,
         model=model,
         effort=effort,
@@ -137,6 +156,8 @@ def build_launch(
         session_id=session_id,
         auto_approve=auto_approve,
     )
+    check_cmd_shim_argv(binary, launch.argv)
+    return launch
 
 
 def _grok(**kw) -> Launch:
@@ -166,7 +187,6 @@ def _claude(**kw) -> Launch:
         argv += ["--resume", kw["session_id"]]
     argv += [
         "-p",
-        kw["prompt"],
         "--model",
         kw["model"],
         "--effort",
@@ -176,33 +196,49 @@ def _claude(**kw) -> Launch:
     ]
     if kw["auto_approve"]:
         argv.append("--dangerously-skip-permissions")
-    return Launch("claude", argv, kw["cwd"], kw["env"], kw["prompt_file"])
+    return Launch("claude", argv, kw["cwd"], kw["env"], kw["prompt_file"], stdin=kw["prompt"])
+
+
+AGY_MAX_ARGV_CHARS = 30000  # Windows CreateProcess limit is 32767 chars for the whole command line
+
+
+def _agy_argv(kw: dict, prompt: str) -> list[str]:
+    argv = [kw["binary"]]
+    if kw["session_id"]:
+        argv += ["--conversation", kw["session_id"]]
+    argv += [
+        "-p",
+        prompt,
+        "--model",
+        kw["model"],
+        "--effort",
+        kw["effort"],
+        "--output-format",
+        "json",
+    ]
+    if kw["auto_approve"]:
+        argv.append("--dangerously-skip-permissions")
+    return argv
 
 
 def _gemini(**kw) -> Launch:
     name = binary_name(kw["binary"])
-    argv = [kw["binary"]]
+    stdin = None
     if name == "agy":
-        if kw["session_id"]:
-            argv += ["--conversation", kw["session_id"]]
-        argv += [
-            "-p",
-            kw["prompt"],
-            "--model",
-            kw["model"],
-            "--effort",
-            kw["effort"],
-            "--output-format",
-            "json",
-        ]
-        if kw["auto_approve"]:
-            argv.append("--dangerously-skip-permissions")
+        argv = _agy_argv(kw, kw["prompt"])
+        # Never put prompt text in the argv of a .cmd/.bat/.ps1 (cmd.exe would parse it).
+        unsafe_binary = _windows() and Path(kw["binary"]).suffix.lower() != ".exe"
+        if unsafe_binary or len(subprocess.list2cmdline(argv)) > AGY_MAX_ARGV_CHARS:
+            pointer = (
+                "Leia o arquivo abaixo e siga integralmente as instrucoes contidas nele "
+                f"(ele e a tarefa completa): {Path(kw['prompt_file']).resolve()}"
+            )
+            argv = _agy_argv(kw, pointer)
     else:
+        argv = [kw["binary"]]
         if kw["session_id"]:
             argv += ["--resume", kw["session_id"]]
         argv += [
-            "-p",
-            kw["prompt"],
             "-m",
             kw["model"],
             "-o",
@@ -210,7 +246,8 @@ def _gemini(**kw) -> Launch:
         ]
         if kw["auto_approve"]:
             argv.append("-y")
-    return Launch("gemini", argv, kw["cwd"], kw["env"], kw["prompt_file"])
+        stdin = kw["prompt"]
+    return Launch("gemini", argv, kw["cwd"], kw["env"], kw["prompt_file"], stdin=stdin)
 
 
 def _codex(**kw) -> Launch:
@@ -224,8 +261,9 @@ def _codex(**kw) -> Launch:
         kw["model"],
         "-c",
         f"model_reasoning_effort={kw['effort']}",
-        "-C",
-        kw["cwd"],
+    ]
+    # No -C: the working directory comes from Launch.cwd (and `codex exec resume` rejects -C).
+    argv += [
         "--skip-git-repo-check",
         "--thread-source",
         "user",
@@ -258,15 +296,129 @@ def parse_payload(stdout: str) -> dict | None:
     return data if isinstance(data, dict) else None
 
 
-def output_is_error(stdout: str) -> bool:
+CODEX_ERROR_TYPES = ("turn.failed", "error")
+_ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
+_BANNER_RE = re.compile(r"session[ _]id\s*:\s*([A-Za-z0-9][A-Za-z0-9_\-]*)", re.IGNORECASE)
+
+
+def output_is_error(stdout: str, agent: str | None = None) -> bool:
     data = parse_payload(stdout)
-    if not data:
+    if data:
+        if data.get("is_error") is True:
+            return True
+        if data.get("terminal_reason") == "api_error":
+            return True
+    if agent is not None and agent != "codex":
         return False
-    if data.get("is_error") is True:
-        return True
-    if data.get("terminal_reason") == "api_error":
-        return True
+    return _codex_stream_failed(_json_events(stdout))
+
+
+def _codex_failure_message(events: list[dict]) -> str:
+    for event in reversed(events):
+        kind = _event_type(event)
+        if kind == "turn.failed":
+            err = event.get("error")
+            message = err.get("message") if isinstance(err, dict) else err
+        elif kind == "error":
+            message = event.get("message")
+        else:
+            continue
+        if isinstance(message, str) and message.strip():
+            return message.strip()
+    return ""
+
+
+def failure_text(agent: str, stdout: str, stderr: str | None = None) -> str:
+    """Best error message of a failed run. For codex, the stream's own
+    turn.failed/error message; otherwise "" (callers fall back to text/stderr)."""
+    if agent != "codex":
+        return ""
+    return _codex_failure_message(_json_events(stdout))
+
+
+RESUME_MISSING_PATTERNS = (
+    "no rollout found",
+    "session not found",
+    "no conversation found",
+    "conversation not found",
+    "could not find session",
+    "invalid session",
+    "thread not found",
+)
+
+
+def resume_missing(agent: str, stdout: str | None, stderr: str | None, text: str | None = None) -> bool:
+    """True when a failed resume was rejected because the harness no longer has that session."""
+    blob = "\n".join(part for part in (stdout, stderr, text) if part).lower()
+    return any(pattern in blob for pattern in RESUME_MISSING_PATTERNS)
+
+
+def _json_events(raw: str) -> list[dict]:
+    events = []
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            events.append(obj)
+    return events
+
+
+def _event_type(event: dict) -> str:
+    value = event.get("type")
+    return value if isinstance(value, str) else ""
+
+
+def _is_codex_stream(events: list[dict]) -> bool:
+    for event in events:
+        kind = _event_type(event)
+        if kind == "error" or kind.startswith(("thread.", "turn.", "item.")):
+            return True
     return False
+
+
+def _codex_stream_failed(events: list[dict]) -> bool:
+    failed = False
+    for event in events:
+        kind = _event_type(event)
+        if kind == "turn.failed":
+            return True
+        if kind == "error":
+            failed = True
+        elif kind == "turn.completed":
+            # An error followed by a completed turn was a transient (e.g. reconnect) notice.
+            failed = False
+    return failed
+
+
+def _codex_stream_text(events: list[dict]) -> str:
+    last = ""
+    for event in events:
+        if _event_type(event) != "item.completed":
+            continue
+        item = event.get("item")
+        if isinstance(item, dict) and item.get("type") == "agent_message":
+            text = item.get("text")
+            if isinstance(text, str) and text.strip():
+                last = text.strip()
+    if last:
+        return last
+    for event in reversed(events):
+        kind = _event_type(event)
+        if kind == "error":
+            message = event.get("message")
+        elif kind == "turn.failed":
+            err = event.get("error")
+            message = err.get("message") if isinstance(err, dict) else err
+        else:
+            continue
+        if isinstance(message, str) and message.strip():
+            return message.strip()
+    return ""
 
 
 def extract_text(
@@ -277,12 +429,15 @@ def extract_text(
 ) -> tuple[str, str | None]:
     session = _session_from_stdout(stdout) or _session_from_banner(stderr or "")
     if last_message_file and last_message_file.is_file():
-        text = last_message_file.read_text(encoding="utf-8").strip()
+        text = last_message_file.read_text(encoding="utf-8", errors="replace").strip()
         if text:
             return text, session
     raw = (stdout or "").strip()
     if not raw:
         return "", session
+    events = _json_events(raw)
+    if agent == "codex" and _is_codex_stream(events):
+        return _codex_stream_text(events), session
     data = parse_payload(raw)
     if isinstance(data, dict):
         text = _text_from_obj(data)
@@ -342,11 +497,12 @@ def _session_from_stdout(stdout: str) -> str | None:
 
 
 def _session_from_banner(text: str) -> str | None:
-    for line in (text or "").splitlines():
-        stripped = line.strip()
-        if stripped.lower().startswith("session id:"):
-            value = stripped.split(":", 1)[1].strip()
-            return value or None
+    for line in _ANSI_RE.sub("", text or "").splitlines():
+        if line.lstrip().startswith("{"):
+            continue
+        match = _BANNER_RE.search(line)
+        if match:
+            return match.group(1)
     return None
 
 
@@ -376,15 +532,36 @@ def _last_json_object(raw: str) -> dict | None:
 
 
 def run_launch(launch: Launch, timeout: int) -> subprocess.CompletedProcess:
-    return subprocess.run(
+    popen_kwargs: dict = {}
+    if os.name != "nt":
+        popen_kwargs["start_new_session"] = True
+    stdin_text = launch.stdin if launch.stdin else None
+    proc = subprocess.Popen(
         launch.argv,
         cwd=launch.cwd,
         env=launch.env,
-        input=launch.stdin,
-        capture_output=True,
+        stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
         encoding="utf-8",
         errors="replace",
-        timeout=None if timeout == 0 else timeout,
-        check=False,
+        **popen_kwargs,
     )
+    try:
+        stdout, stderr = proc.communicate(
+            input=stdin_text,
+            timeout=None if timeout == 0 else timeout,
+        )
+    except (subprocess.TimeoutExpired, KeyboardInterrupt):
+        procs.kill_tree(proc.pid)
+        try:
+            proc.kill()
+        except OSError:
+            pass
+        try:
+            proc.communicate(timeout=5)
+        except Exception:
+            pass
+        raise
+    return subprocess.CompletedProcess(launch.argv, proc.returncode, stdout, stderr)

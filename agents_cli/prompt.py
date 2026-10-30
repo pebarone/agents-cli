@@ -17,15 +17,16 @@ resume: {resume}
 
 You are a local coding agent receiving a message from another agent on this PC.
 Each agent runs in its own native harness. You share the working directory above.
-Answer by doing the work. Your printed reply is the message that goes back to the sender.
+Answer by doing the work. Your final printed answer is delivered back to the sender
+automatically. Do NOT run `agents reply` or `agents delegate` to answer the sender;
+just print the answer.
 
-To send a message to another local agent (or back to the sender), run this command
-(Git Bash on Windows cannot see agents.cmd; do not gate on `command -v agents`):
-  {cli} delegate <agent> [model] [effort] --conversation {conversation} --prompt "..."
-  {cli} reply --conversation {conversation} --prompt "..."
-
-Slash form inside a session that already loaded the shared skill:
-  /delegate <agent> <model> <effort> <task>
+Use the bus only to reach a DIFFERENT agent for a sub-task (Git Bash on Windows
+cannot see agents.cmd; do not gate on `command -v agents`):
+  {cli} delegate <agent> [model] [effort] --prompt "..."
+- Sub-task unrelated to this conversation: add --new.
+- Long text: write it to a file and use --prompt-file <path>.
+- Fan out: add --background (prints a job id), then `{cli} wait <job> [<job> ...]`.
 
 Do not impersonate the other harness. Do the work with YOUR tools.
 {resume_rule}
@@ -91,19 +92,49 @@ def wrap_prompt(
     return header + body.strip() + "\n"
 
 
-def render_history(messages: list[dict], limit: int = 20) -> str:
+TRUNCATED = "[... truncado ...]"
+
+
+def _clip(body: str, max_chars: int) -> str:
+    if max_chars <= 0 or len(body) <= max_chars:
+        return body
+    head = max_chars * 2 // 3
+    tail = max_chars - head
+    return f"{body[:head].rstrip()}\n{TRUNCATED}\n{body[-tail:].lstrip()}"
+
+
+def render_history(
+    messages: list[dict],
+    limit: int = 20,
+    max_message_chars: int = 4000,
+    max_total_chars: int = 24000,
+) -> str:
+    """Earlier messages for a session that is not resumed. Each message is capped
+    at `max_message_chars`; the block keeps the most recent messages that fit in
+    `max_total_chars`."""
     if not messages:
         return ""
-    slice_ = messages[-limit:]
-    lines = ["--- earlier messages in this conversation ---"]
-    for item in slice_:
+    blocks = []
+    for item in messages[-limit:]:
         speaker = item.get("from") or item.get("agent") or "unknown"
         body = (item.get("text") or "").strip()
         if not body:
             continue
-        lines.append(f"[{speaker}]")
-        lines.append(body)
-        lines.append("")
+        blocks.append(f"[{speaker}]\n{_clip(body, max_message_chars)}\n")
+    if not blocks:
+        return ""
+    kept: list[str] = []
+    used = 0
+    for block in reversed(blocks):
+        if kept and max_total_chars > 0 and used + len(block) > max_total_chars:
+            break
+        kept.append(block)
+        used += len(block)
+    kept.reverse()
+    lines = ["--- earlier messages in this conversation ---"]
+    if len(kept) < len(blocks):
+        lines.append(TRUNCATED)
+    lines.extend(kept)
     lines.append("--- end of earlier messages ---")
     lines.append("")
     return "\n".join(lines)

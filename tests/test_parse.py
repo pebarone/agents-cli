@@ -1,3 +1,5 @@
+import os
+import tempfile
 import unittest
 
 from agents_cli.parse import ParseError, normalize_effort, parse_slash, parse_tokens
@@ -36,3 +38,59 @@ class ParseTests(unittest.TestCase):
         self.assertEqual(req.model, "grok-4.6")
         self.assertIsNone(req.effort)
         self.assertEqual(req.prompt, "review the diff")
+
+    def test_free_text_task_keeps_first_word(self):
+        req = parse_tokens(["codex", "fix", "the", "bug"])
+        self.assertIsNone(req.model)
+        self.assertIsNone(req.effort)
+        self.assertEqual(req.prompt, "fix the bug")
+
+    def test_known_model_name_and_effort(self):
+        req = parse_tokens(["claude", "sonnet", "high", "fix", "it"])
+        self.assertEqual((req.model, req.effort, req.prompt), ("sonnet", "high", "fix it"))
+
+    def test_model_shaped_tokens(self):
+        self.assertEqual(parse_tokens(["codex", "gpt-6.1-sol", "do", "it"]).model, "gpt-6.1-sol")
+        self.assertEqual(parse_tokens(["grok", "x/y:z", "hi"]).model, "x/y:z")
+        self.assertEqual(parse_tokens(["codex", "o3", "hi"]).model, "o3")
+
+    def test_prose_with_whitespace_or_punctuation_is_not_model(self):
+        self.assertIsNone(parse_tokens(["codex", "fix the bug"]).model)
+        self.assertIsNone(parse_tokens(["codex", "Fix!", "now"]).model)
+
+    def test_configured_model_is_recognised(self):
+        self.assertIsNone(parse_tokens(["codex", "turbo", "go"]).model)
+        req = parse_tokens(["codex", "turbo", "go"], known_models=["turbo"])
+        self.assertEqual((req.model, req.prompt), ("turbo", "go"))
+
+    def test_file_like_first_word_is_not_a_model(self):
+        req = parse_tokens(["codex", "README.md", "has", "a", "typo"])
+        self.assertIsNone(req.model)
+        self.assertEqual(req.prompt, "README.md has a typo")
+        for name in ("main.py", "app.TSX", "build.cmd", "notes.txt", "data.csv", "x.lock"):
+            self.assertIsNone(parse_tokens(["codex", name, "now"]).model, name)
+        req = parse_tokens(["codex", "gpt-6.1-sol", "fix"])
+        self.assertEqual((req.model, req.prompt), ("gpt-6.1-sol", "fix"))
+
+    def test_existing_path_is_not_a_model(self):
+        old = os.getcwd()
+        with tempfile.TemporaryDirectory() as tmp:
+            os.chdir(tmp)
+            try:
+                self.assertEqual(parse_tokens(["codex", "foo-1", "go"]).model, "foo-1")
+                open("foo-1", "w").close()
+                self.assertIsNone(parse_tokens(["codex", "foo-1", "go"]).model)
+                os.mkdir("sub-2")
+                self.assertIsNone(parse_tokens(["codex", "sub-2", "go"]).model)
+            finally:
+                os.chdir(old)
+
+    def test_prompt_given_ignores_file_heuristic(self):
+        req = parse_tokens(["codex", "README.md"], prompt_given=True)
+        self.assertEqual(req.model, "README.md")
+
+    def test_prompt_given_keeps_first_token_as_model(self):
+        req = parse_tokens(["codex", "whatever", "high"], prompt_given=True)
+        self.assertEqual((req.model, req.effort, req.prompt), ("whatever", "high", ""))
+        req = parse_tokens(["codex", "high"], prompt_given=True)
+        self.assertEqual((req.model, req.effort), (None, "high"))

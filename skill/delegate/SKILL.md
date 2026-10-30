@@ -74,7 +74,28 @@ python -u C:\Users\augus\Desktop\agents_cli\agents.py delegate <agent> <model> <
 
 Do not `--no-resume` on a follow-up. Do not paste the previous reply back
 into the prompt when the session is being resumed; the other harness
-already has it.
+already has it. If that session is busy (a job still running in the same
+conversation) or is your own, the CLI starts a fresh session with history and
+prints `[agents] aviso: ...` on stderr.
+
+## Your output is the reply
+
+When another agent delegated to you, your final printed answer goes back to
+it automatically. Just print the answer. Do **not** run `agents reply` or
+`agents delegate` to answer the sender (`reply` refuses with exit 2). Delegate
+only to a **different** agent for a sub-task, with `--new` if it is unrelated
+to this conversation.
+
+## Fan out (background + wait)
+
+```text
+python -u C:\Users\augus\Desktop\agents_cli\agents.py delegate <agent> --background --new --prompt "<task>"   # prints a job id
+python -u C:\Users\augus\Desktop\agents_cli\agents.py wait <job> [<job> ...] [--timeout SEC] [--json]
+```
+
+Start several, then `wait` on all. One job prints its text; several print
+`=== agent job (status) ===` blocks. Exit 0 only if all are ok, 1 if one
+failed, 3 if the wait timed out. A job whose process died becomes `error`.
 
 ## Do this
 
@@ -94,7 +115,14 @@ python -u C:\Users\augus\Desktop\agents_cli\agents.py delegate <agent> <model> <
    reply to the user. Quote it; do not rewrite it as if you did the work.
 4. Same working directory as you. The other agent sees this repo.
 
-Reply on the same thread:
+Long prompts: write them to a file and pass `--prompt-file <path>` (no quoting
+problems). A free-text task such as `delegate codex fix the bug` works when the
+first word does not look like a model (`sonnet`, `gpt-6.1-sol`...) or a file
+(`README.md`, or a path that exists here). Prefer `--prompt` / `--prompt-file`:
+with them the first loose argument is always the model.
+
+Talk to the other side of a thread from outside a hop (not to answer the agent
+waiting on you); use `--prompt=<text>` if the text starts with `-`:
 
 ```text
 python -u C:\Users\augus\Desktop\agents_cli\agents.py reply --conversation <id> --prompt "<message>"
@@ -112,9 +140,15 @@ Status:
 ```text
 python -u C:\Users\augus\Desktop\agents_cli\agents.py list
 python -u C:\Users\augus\Desktop\agents_cli\agents.py doctor
+python -u C:\Users\augus\Desktop\agents_cli\agents.py status
 python -u C:\Users\augus\Desktop\agents_cli\agents.py log
-python -u C:\Users\augus\Desktop\agents_cli\agents.py log <conversation>
+python -u C:\Users\augus\Desktop\agents_cli\agents.py log <conversation> --tail 5
 ```
+
+`status` shows the latest 10 conversations and jobs (`stale` = the process
+died). `doctor` also prints a `codex (chrome e sessoes):` section (read-only
+diagnosis of Codex driving Chrome and of `~/.codex/sessions`; informational,
+never changes the exit code).
 
 ## Rules
 

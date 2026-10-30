@@ -1,6 +1,6 @@
 """Local bus so Codex, Gemini, Claude and Grok can send messages to each other."""
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 
 AGENTS = ("codex", "gemini", "claude", "grok")
 ALIASES = {

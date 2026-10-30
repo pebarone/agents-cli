@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import os
-import subprocess
 from pathlib import Path
 
 from agents_cli import ALIASES
+from agents_cli import procs
 
 
 PARENT_MAP = {
@@ -18,39 +18,32 @@ PARENT_MAP = {
 }
 
 
+def _agent_from_name(name: str) -> str | None:
+    return PARENT_MAP.get(Path(name).stem.lower())
+
+
 def whoami() -> str:
     explicit = os.environ.get("AGENTS_SELF", "").strip().lower()
     if explicit:
         return ALIASES.get(explicit, explicit)
-    parent = parent_process_name()
-    if parent:
-        stem = Path(parent).stem.lower()
-        if stem in PARENT_MAP:
-            return PARENT_MAP[stem]
+    try:
+        names = procs.ancestor_names()
+    except Exception:
+        names = []
+    for name in names:
+        agent = _agent_from_name(name)
+        if agent:
+            return agent
+    if os.environ.get("CLAUDECODE"):
+        return "claude"
+    if os.environ.get("GEMINI_CLI"):
+        return "gemini"
     return "unknown"
 
 
 def parent_process_name() -> str | None:
-    ppid = os.getppid()
-    if os.name != "nt":
-        try:
-            return Path(os.readlink(f"/proc/{ppid}/exe")).name
-        except OSError:
-            return None
     try:
-        completed = subprocess.run(
-            [
-                "powershell",
-                "-NoProfile",
-                "-Command",
-                f"(Get-Process -Id {ppid} -ErrorAction SilentlyContinue).ProcessName",
-            ],
-            capture_output=True,
-            text=True,
-            timeout=8,
-            check=False,
-        )
-    except (OSError, subprocess.TimeoutExpired):
+        names = procs.ancestor_names(limit=1)
+    except Exception:
         return None
-    name = (completed.stdout or "").strip()
-    return name or None
+    return names[0] if names else None
