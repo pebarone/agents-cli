@@ -1,0 +1,12 @@
+[project]
+name = "agents-cli"
+version = "0.1.0"
+description = "Bus for local Codex, Gemini, Claude and Grok harnesses to send messages to each other."
+requires-python = ">=3.11"
+readme = "README.md"
+
+[project.scripts]
+agents = "agents_cli.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["agents_cli*"]
