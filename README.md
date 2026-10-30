@@ -98,6 +98,27 @@ agents log                           # lista conversas
 agents log c0a1b2c3d4e5 --tail 5     # ultimas 5 mensagens (--json disponivel)
 ```
 
+## Retomar uma sessao que voce ja tem (por nome)
+
+Sessoes criadas fora do bus (nomeadas no app do Codex, com `/rename` no Claude, etc.) podem ser continuadas pelo nome ou pelo id:
+
+```powershell
+agents sessions codex                       # lista, mais recentes primeiro (--limit 20, --all inclui arquivadas, --json)
+agents sessions codex fiscal                # filtra por nome, id ou pasta (sem acento, sem maiusculas)
+agents resume codex "Revisao Fiscal" --prompt "continue de onde parou"
+agents resume session claude "Nome da Sessao" --prompt-file pedido.txt
+```
+
+Forma slash: `/delegate resume [session] <agente> "<nome>" [mensagem]` vira `agents resume <agente> "<nome>" --prompt "<mensagem>"` (`agents delegate resume ...` tambem funciona). A mensagem entra so por `--prompt` ou `--prompt-file`: palavras soltas depois do agente fazem parte do nome (`agents resume codex revisao fiscal` procura "revisao fiscal").
+
+- Cada harness le o proprio armazenamento, so para leitura: Codex (`~/.codex/state_*.sqlite`), Claude (`~/.claude/projects`), Grok (`~/.grok/sessions`) e Antigravity (`~/.gemini/antigravity-cli`). O Gemini CLI (`gemini.cmd`) nao retoma por id: use o `agy`.
+- O nome casa, nesta ordem, por: id exato; nome exato (sem acento, sem maiusculas); prefixo unico do id, so para texto com cara de id hexadecimal (6+ caracteres); e trecho do nome. Nome repetido, ou trecho que casa com mais de uma sessao, vale a unica que for retomavel. Se ainda sobrar mais de uma, a CLI lista ate 10 candidatas (id, data, nome, pasta) e pede o id: `agents resume codex 01a18cd4 --prompt "..."`.
+- Sem `--prompt`, `resume` so liga a sessao a uma conversa do bus (imprime o id da conversa; as proximas vezes reusa a mesma conversa). Siga com `agents delegate <agente> --conversation <id> --prompt "..."`.
+- A sessao roda na pasta em que foi criada (`--cwd` troca). Modelo e esforco continuam os da sessao, a menos que voce passe `--model`/`--effort`.
+- A sessao do usuario nunca e trocada por uma nova: se o harness nao conseguir retoma-la, o job falha com `a sessao "<nome>" (<id>) nao pode ser retomada pelo <agente>: <motivo>`; se ela estiver ocupada por outro job, tambem falha. Sessoes marcadas `[nao retomavel: ...]` nao podem ser continuadas. No Codex, sessoes criadas enquanto `~/.codex/sessions` nao podia ser gravado nao tem rollout neste PC e aparecem como `nao retomavel`.
+- Nao use a mesma sessao ao mesmo tempo no app/TUI do Codex (ou no Claude/Grok interativo) e pelo bus.
+- Sessoes criadas pelo bus aparecem em `agents sessions` como `[bus] <primeira linha da mensagem>`, sem o cabecalho do protocolo.
+
 ## Como a mensagem viaja
 
 1. Voce (ou um agente) chama `agents delegate claude ...`

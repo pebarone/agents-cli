@@ -4,6 +4,8 @@ from agents_cli import PROTOCOL
 from agents_cli.home import cli_command
 
 
+SESSION_VALUE = "(da sessao)"  # model/effort left to the resumed session
+
 HEADER = """[agents-bus protocol={protocol}]
 from: {from_agent}
 to: {to_agent}
@@ -40,8 +42,8 @@ def wrap_prompt(
     body: str,
     from_agent: str,
     to_agent: str,
-    model: str,
-    effort: str,
+    model: str | None,
+    effort: str | None,
     conversation: str,
     job: str,
     cwd: str,
@@ -77,8 +79,8 @@ def wrap_prompt(
         protocol=PROTOCOL,
         from_agent=from_agent,
         to_agent=to_agent,
-        model=model,
-        effort=effort,
+        model=model or SESSION_VALUE,
+        effort=effort or SESSION_VALUE,
         conversation=conversation,
         job=job,
         depth=depth,

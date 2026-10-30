@@ -27,6 +27,24 @@ class PromptTests(unittest.TestCase):
         self.assertIn("command -v agents", text)
         self.assertIn("This is a new session", text)
 
+    def test_missing_model_and_effort_say_the_session_decides(self):
+        text = wrap_prompt(
+            body="oi",
+            from_agent="grok",
+            to_agent="codex",
+            model=None,
+            effort=None,
+            conversation="c1",
+            job="j1",
+            cwd="C:/repo",
+            depth=1,
+            max_depth=4,
+            resume="sess",
+        )
+        self.assertIn("model: (da sessao)", text)
+        self.assertIn("effort: (da sessao)", text)
+        self.assertNotIn("None", text)
+
     def test_max_depth_forbids_nested(self):
         text = wrap_prompt(
             body="x",

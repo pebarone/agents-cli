@@ -28,15 +28,15 @@ class HarnessTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def _launch(self, agent, session_id=None, auto_approve=True):
+    def _launch(self, agent, session_id=None, auto_approve=True, model="m", effort="high", binary=None):
         return build_launch(
             agent=agent,
-            model="m",
-            effort="high",
+            model=model,
+            effort=effort,
             prompt="hello",
             cwd=str(self.job),
             job_dir=self.job / agent,
-            config={"binaries": {agent: agent}},
+            config={"binaries": {agent: binary or agent}},
             from_agent="grok",
             conversation="c1",
             depth=1,
@@ -80,6 +80,36 @@ class HarnessTests(unittest.TestCase):
         self.assertNotIn("-C", launch.argv)
         self.assertEqual(launch.cwd, str(self.job))
         self.assertEqual(launch.argv[-1], "-")
+
+    def test_unset_model_and_effort_are_omitted_for_every_agent(self):
+        flags = {
+            "grok": ("--model", "--reasoning-effort"),
+            "claude": ("--model", "--effort"),
+            "codex": ("-m", "model_reasoning_effort"),
+        }
+        for agent, names in flags.items():
+            for empty in (None, ""):
+                with self.subTest(agent=agent, empty=empty):
+                    launch = self._launch(agent, session_id="sess", model=empty, effort=empty)
+                    for name in names:
+                        self.assertFalse([a for a in launch.argv if a.startswith(name)], launch.argv)
+                    self.assertIn("sess", launch.argv)
+                    self.assertNotIn(None, launch.argv)
+        kept = self._launch("codex", model="gpt-x", effort=None)
+        self.assertEqual(kept.argv[kept.argv.index("-m") + 1], "gpt-x")
+        self.assertFalse([a for a in kept.argv if a.startswith("model_reasoning_effort")])
+        only_effort = self._launch("claude", model=None, effort="low")
+        self.assertNotIn("--model", only_effort.argv)
+        self.assertEqual(only_effort.argv[only_effort.argv.index("--effort") + 1], "low")
+
+    def test_unset_model_and_effort_are_omitted_for_gemini_binaries(self):
+        agy = self._launch("gemini", session_id="conv-1", model=None, effort=None, binary="C:/agy/agy.exe")
+        self.assertNotIn("--model", agy.argv)
+        self.assertNotIn("--effort", agy.argv)
+        self.assertEqual(agy.argv[agy.argv.index("--conversation") + 1], "conv-1")
+        cli = self._launch("gemini", model=None, effort=None, binary="C:/npm/gemini.cmd")
+        self.assertNotIn("-m", cli.argv)
+        self.assertNotIn(None, cli.argv)
 
     def test_codex_never_passes_cwd_flag(self):
         for session in (None, "abc"):

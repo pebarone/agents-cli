@@ -12,11 +12,14 @@ from agents_cli import ALIASES, EFFORTS, __version__, codex_chrome
 from agents_cli.bus import (
     add_participant,
     append_message,
+    bind_external_session,
     create_job,
     conversation_dir,
     enqueue_inbox,
+    ensure_bus,
     ensure_conversation,
     file_lock,
+    find_conversation_for_session,
     forget_session,
     job_age_sec,
     job_dir,
@@ -47,10 +50,17 @@ from agents_cli.harness import (
     run_launch,
     which,
 )
+from agents_cli.harness_sessions import (
+    HarnessSession,
+    find_session,
+    format_when,
+    list_sessions,
+    matches_filter,
+)
 from agents_cli.home import launcher_path
 from agents_cli.install import doctor_links, install, uninstall
 from agents_cli.parse import ParseError, normalize_agent, parse_tokens
-from agents_cli.prompt import render_history, wrap_prompt
+from agents_cli.prompt import SESSION_VALUE, render_history, wrap_prompt
 
 LIVE = ("queued", "running")
 CORRUPT_GRACE_SEC = 10.0
@@ -58,6 +68,9 @@ CORRUPT_GRACE_SEC = 10.0
 
 def main(argv: list[str] | None = None) -> int:
     _configure_stdio()
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if len(argv) >= 2 and argv[0] == "delegate" and argv[1] in ("resume", "sessions"):
+        argv = argv[1:]  # `/delegate resume ...` is `agents resume ...`
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
@@ -130,6 +143,28 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--background", action="store_true", help="dispara em segundo plano e imprime o id do job")
     p.add_argument("--job", help=argparse.SUPPRESS)
     p.set_defaults(func=cmd_delegate)
+
+    p = sub.add_parser("sessions", help="lista as sessoes que um harness ja tem (nomeadas ou nao)")
+    p.add_argument("agent")
+    p.add_argument("filter", nargs="*", help="filtra por nome, id ou pasta")
+    p.add_argument("--limit", type=int, default=20, help="maximo de linhas (0 = todas)")
+    p.add_argument("--all", action="store_true", help="inclui sessoes arquivadas")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_sessions)
+
+    p = sub.add_parser("resume", help="continua uma sessao existente de um harness, pelo nome ou id")
+    p.add_argument("target", nargs="+", metavar="[session] agent nome-ou-id")
+    p.add_argument("--prompt", help="use --prompt=<texto> se o texto comecar com '-'")
+    p.add_argument("--prompt-file")
+    p.add_argument("--model")
+    p.add_argument("--effort", choices=list(EFFORTS))
+    p.add_argument("--from", dest="from_agent")
+    p.add_argument("--cwd")
+    p.add_argument("--timeout", type=int)
+    p.add_argument("--json", action="store_true")
+    p.add_argument("--background", action="store_true", help="dispara em segundo plano e imprime o id do job")
+    p.add_argument("--approve", choices=["auto", "prompt"])
+    p.set_defaults(func=cmd_resume)
 
     p = sub.add_parser("send", help="enfileira uma mensagem sem esperar")
     p.add_argument("agent")
@@ -253,11 +288,20 @@ def _plan_session(args, conversation: dict, request, config: dict, exclude_job: 
     cid = conversation["id"]
     record = session_record(conversation, request.agent)
     session_id = None if (args.no_resume or args.new) else record.get("id")
+    external = bool(session_id and record.get("external"))
     warning = None
     if session_id:
         busy = running_jobs(cid, request.agent, exclude=exclude_job)
         me = (os.environ.get("AGENTS_SELF") or "").strip().lower()
         me = ALIASES.get(me, me)
+        if external and busy:
+            # A fresh session would drop the context the user asked to continue.
+            raise ParseError(f'a sessao "{_session_label(record)}" ja esta em uso por outro job ({busy[0].get("id")})')
+        if external and me == request.agent and cid == os.environ.get("AGENTS_CONVERSATION"):
+            raise ParseError(
+                f'a sessao "{_session_label(record)}" e a que esta rodando agora nesta conversa; '
+                "nao da para retoma-la de dentro dela"
+            )
         if busy:
             warning = (
                 f"sessao de {request.agent} ocupada pelo job {busy[0].get('id')}; "
@@ -271,9 +315,16 @@ def _plan_session(args, conversation: dict, request, config: dict, exclude_job: 
         if warning:
             session_id = None
             record = {}
-    model = request.model or (record.get("model") if session_id else None) or default_model(request.agent, config)
-    effort = request.effort or (record.get("effort") if session_id else None) or default_effort(request.agent, config)
+    model = request.model or (record.get("model") if session_id else None)
+    effort = request.effort or (record.get("effort") if session_id else None)
+    if not external:  # an external session keeps the model/effort it already has
+        model = model or default_model(request.agent, config)
+        effort = effort or default_effort(request.agent, config)
     return session_id, model, effort, warning
+
+
+def _session_label(record: dict) -> str:
+    return str(record.get("name") or record.get("id") or "?")
 
 
 class _ClaimLost(Exception):
@@ -469,6 +520,8 @@ def _run_delegate(args, config, request, conversation, job, session_id, from_age
             print(json.dumps(payload, indent=2, ensure_ascii=False) if args.json else _format_dry_run(payload))
             return 0
 
+        bound = session_record(load_conversation(cid) or conversation, request.agent)
+        external = bool(session_id and bound.get("external") and bound.get("id") == session_id)
         retried = False
         while True:
             completed = run_launch(launch, timeout)
@@ -484,6 +537,14 @@ def _run_delegate(args, config, request, conversation, job, session_id, from_age
             if not failed and not switched:
                 break
             if session_id and not retried and resume_missing(request.agent, stdout, stderr, text):
+                if external:
+                    # Never swap the user's own session for a fresh one: report and keep the record.
+                    reason = _short_reason(failure_text(request.agent, stdout, stderr) or stderr or text)
+                    message = (
+                        f'a sessao "{_session_label(bound)}" ({session_id}) '
+                        f"nao pode ser retomada pelo {request.agent}: {reason}"
+                    )
+                    return _fail(args, job, from_agent, "error", completed.returncode or 1, message, f"erro: {message}")
                 retried = True
                 _keep_first_attempt(jid)
                 print(
@@ -498,6 +559,13 @@ def _run_delegate(args, config, request, conversation, job, session_id, from_age
                 _announce(cid, jid, None, request.model, request.effort)
                 continue
             if not failed:
+                if switched and external:
+                    # The user's own session is never replaced by the one the harness answered in.
+                    message = (
+                        f'a sessao "{_session_label(bound)}" ({session_id}) nao pode ser retomada '
+                        f"pelo {request.agent}: o harness respondeu em outra sessao ({session})"
+                    )
+                    return _fail(args, job, from_agent, "error", 1, message, f"erro: {message}")
                 break
             detail =(failure_text(request.agent, stdout, stderr) or text or stderr or stdout)[-4000:]
             return _fail(args, job, from_agent, "error", completed.returncode or 1, detail, detail)
@@ -565,6 +633,14 @@ def _run_delegate(args, config, request, conversation, job, session_id, from_age
         print(text)
     return 0
 
+
+
+def _short_reason(text: str | None) -> str:
+    for line in (text or "").splitlines():
+        line = line.strip()
+        if line:
+            return line[:200]
+    return "o harness nao encontrou a sessao"
 
 
 def _keep_first_attempt(jid: str) -> None:
@@ -749,6 +825,129 @@ def spawn_detached(argv: list[str], log_path: Path, cwd: str | None = None) -> i
     finally:
         log.close()
     return proc.pid
+
+
+# --- sessions / resume ------------------------------------------------------
+
+
+def _session_view(item: HarnessSession) -> dict:
+    return {
+        "agent": item.agent,
+        "id": item.id,
+        "name": item.name,
+        "cwd": item.cwd,
+        "updated": item.updated,
+        "updated_iso": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(item.updated)) if item.updated else None,
+        "resumable": item.resumable,
+        "note": item.note,
+        "archived": item.archived,
+    }
+
+
+def _session_row(item: HarnessSession) -> str:
+    row = f"{format_when(item.updated)}  {item.id[:8]}  {item.name}  {item.cwd or '-'}"
+    if not item.resumable:
+        row += f" [nao retomavel: {item.note or 'sem detalhe'}]"
+    if item.archived:
+        row += " [arquivada]"
+    return row
+
+
+def cmd_sessions(args) -> int:
+    config = load_config()
+    agent = normalize_agent(args.agent)
+    query = " ".join(args.filter).strip()
+    rows = [
+        item
+        for item in list_sessions(agent, include_archived=args.all, config=config)
+        if matches_filter(item, query)
+    ]
+    if args.limit and args.limit > 0:
+        rows = rows[: args.limit]
+    if args.json:
+        print(json.dumps([_session_view(item) for item in rows], indent=2, ensure_ascii=False))
+        return 0
+    if not rows:
+        print("nenhuma sessao")
+        return 0
+    for item in rows:
+        print(_session_row(item))
+    return 0
+
+
+SESSION_WORDS = ("session", "sessao", "sessão", "sessions")
+
+
+def cmd_resume(args) -> int:
+    config = load_config()
+    tokens = list(args.target)
+    if tokens and tokens[0].lower() in SESSION_WORDS:
+        tokens = tokens[1:]
+    if len(tokens) < 2:
+        raise ParseError("uso: agents resume [session] <agent> <nome-ou-id> [--prompt TEXTO]")
+    agent = normalize_agent(tokens[0])
+    query = " ".join(tokens[1:]).strip()
+    if args.prompt is not None and args.prompt_file:
+        raise ParseError("use --prompt ou --prompt-file, nao os dois")
+    has_prompt = bool((args.prompt or "").strip()) or bool(args.prompt_file)
+
+    session = find_session(agent, query, config=config)
+    if not session.resumable:
+        raise ParseError(f'a sessao "{session.name}" nao pode ser retomada: {session.note or "sem detalhe"}')
+    cwd = args.cwd or session.cwd
+    if not cwd:
+        raise ParseError(f'a sessao "{session.name}" nao registrou a pasta; passe --cwd')
+    if not Path(cwd).is_dir():
+        if args.cwd:
+            raise ParseError(f"a pasta nao existe: {cwd}")
+        raise ParseError(f"a pasta da sessao nao existe mais: {cwd}; passe --cwd")
+    cwd = str(Path(cwd).resolve())
+    from_agent = args.from_agent or whoami()
+
+    with file_lock(ensure_bus() / "conversations" / "resume"):
+        existing = find_conversation_for_session(agent, session.id)
+        if existing:
+            cid = existing["id"]
+        else:
+            cid = ensure_conversation(None, cwd, from_agent)[0]["id"]
+        bind_external_session(cid, agent, session.id, session.name)
+    print(
+        f'[agents] conversation={cid} sessao={session.id} nome="{session.name}" cwd={cwd}',
+        file=sys.stderr,
+    )
+
+    if not has_prompt:
+        if args.json:
+            payload = {
+                "conversation": cid,
+                "agent": agent,
+                "session": session.id,
+                "name": session.name,
+                "cwd": cwd,
+            }
+            print(json.dumps(payload, indent=2, ensure_ascii=False))
+        else:
+            print(cid)
+        print(f'continue com: agents delegate {agent} --conversation {cid} --prompt "..."', file=sys.stderr)
+        return 0
+
+    argv = ["delegate", agent, "--conversation", cid, "--cwd", cwd, "--from", from_agent]
+    if args.prompt_file:
+        argv += ["--prompt-file", args.prompt_file]
+    else:
+        argv.append(f"--prompt={args.prompt}")
+    for flag, value in (
+        ("--model", args.model),
+        ("--effort", args.effort),
+        ("--timeout", args.timeout),
+        ("--approve", args.approve),
+    ):
+        if value is not None:
+            argv += [flag, str(value)]
+    for flag, on in (("--json", args.json), ("--background", args.background)):
+        if on:
+            argv.append(flag)
+    return main(argv)
 
 
 # --- send / inbox / reply ---------------------------------------------------
@@ -1044,11 +1243,11 @@ def _resolve_request(args, config, require_binary: bool = True, fill_defaults: b
     return _Req(agent, model, effort, prompt.strip())
 
 
-def _announce(cid: str, job_id: str, session_id: str | None, model: str, effort: str) -> None:
+def _announce(cid: str, job_id: str, session_id: str | None, model: str | None, effort: str | None) -> None:
     resumed = "yes" if session_id else "no"
     print(
         f"[agents] conversation={cid} job={job_id} resumed={resumed} "
-        f"model={model} effort={effort}",
+        f"model={model or SESSION_VALUE} effort={effort or SESSION_VALUE}",
         file=sys.stderr,
     )
 
@@ -1059,8 +1258,8 @@ def _format_dry_run(payload: dict) -> str:
         f"conversation: {payload['conversation']}\n"
         f"job: {payload['job']}\n"
         f"resume: {payload['resume'] or 'new'}\n"
-        f"model: {payload.get('model')}\n"
-        f"effort: {payload.get('effort')}\n"
+        f"model: {payload.get('model') or SESSION_VALUE}\n"
+        f"effort: {payload.get('effort') or SESSION_VALUE}\n"
         f"cwd: {payload['cwd']}\n"
         f"cmd: {argv}\n"
         f"prompt_file: {payload['prompt_file']}\n"

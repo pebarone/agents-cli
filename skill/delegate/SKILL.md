@@ -5,8 +5,9 @@ description: >
   and get the reply. Reuse that agent's existing session for follow-ups of the
   same task (context + prompt cache). Open a new session when the task is
   different. Use when the user runs /delegate, asks you to talk to another
-  agent on this PC, wants Codex/Claude/Grok/Gemini to collaborate, or says
-  "manda pro grok", "pergunta pro claude", "delega pro gemini".
+  agent on this PC, wants Codex/Claude/Grok/Gemini to collaborate, wants to
+  resume a named session of one of them, or says "manda pro grok",
+  "pergunta pro claude", "delega pro gemini".
 ---
 
 # /delegate
@@ -85,6 +86,47 @@ it automatically. Just print the answer. Do **not** run `agents reply` or
 `agents delegate` to answer the sender (`reply` refuses with exit 2). Delegate
 only to a **different** agent for a sub-task, with `--new` if it is unrelated
 to this conversation.
+
+## Resume a named session
+
+The user may ask to continue a session that already exists in a harness (named
+in the Codex app, `/rename` in Claude, ...):
+
+```
+/delegate resume [session] <agent> "<name>" [message]
+```
+
+Map the slash form to the CLI as `resume <agent> "<name>" --prompt "<message>"`.
+The message goes only with `--prompt` (or `--prompt-file` for long text). Words
+after the agent are part of the name, so never append the message as loose words.
+
+Run (never answer as that agent yourself):
+
+```text
+python -u C:\Users\augus\Desktop\agents_cli\agents.py resume <agent> "<name>" --prompt "<message>"
+python -u C:\Users\augus\Desktop\agents_cli\agents.py sessions <agent> [filter]
+```
+
+- `sessions` lists the harness's sessions, newest first (`--limit N`, `--all`
+  for archived, `--json`). Use it when the name is unknown.
+- `<name>` may also be an exact id, a unique id prefix (hex-like text, 6+ chars)
+  or a part of the name. Case and accents are ignored. An exact name wins over an
+  id prefix; a part of the name that matches several sessions picks the only
+  resumable one.
+- If the name is ambiguous the command exits 2 and lists up to 10 candidates
+  (`id`, date, name, folder). Pick one and run it again with its id.
+- A session shown as `[nao retomavel: ...]` cannot be resumed (for Codex: the
+  rollout file is missing on this PC, e.g. it was created while `~/.codex/sessions`
+  was not writable). Tell the user; do not fall back to a new session.
+- Without `--prompt`, `resume` only binds the session and prints a
+  `conversation` id; continue with `delegate <agent> --conversation <id>`.
+- The session keeps its own model and effort unless `--model`/`--effort` is
+  passed, and runs in the folder it was created in (`--cwd` overrides).
+- If the harness cannot resume it, or another job is using it, the command
+  fails with an explicit error. It never silently starts a fresh session.
+- `gemini` only supports this with `agy`; Gemini CLI cannot resume by id.
+- The Codex desktop app / TUI (or an interactive Claude/Grok) must not be
+  using the same session at the same time.
 
 ## Fan out (background + wait)
 

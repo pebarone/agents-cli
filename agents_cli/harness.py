@@ -106,8 +106,8 @@ def check_cmd_shim_argv(binary: str, argv: list[str]) -> None:
 def build_launch(
     *,
     agent: str,
-    model: str,
-    effort: str,
+    model: str | None,
+    effort: str | None,
     prompt: str,
     cwd: str,
     job_dir: Path,
@@ -160,22 +160,19 @@ def build_launch(
     return launch
 
 
+def _flag(name: str, value: str | None) -> list[str]:
+    """`[name, value]`, or nothing when the value is unset (a resumed session keeps its own)."""
+    return [name, value] if value else []
+
+
 def _grok(**kw) -> Launch:
     argv = [kw["binary"]]
     if kw["session_id"]:
         argv += ["--resume", kw["session_id"]]
-    argv += [
-        "--prompt-file",
-        str(kw["prompt_file"]),
-        "--model",
-        kw["model"],
-        "--reasoning-effort",
-        kw["effort"],
-        "--output-format",
-        "json",
-        "--cwd",
-        kw["cwd"],
-    ]
+    argv += ["--prompt-file", str(kw["prompt_file"])]
+    argv += _flag("--model", kw["model"])
+    argv += _flag("--reasoning-effort", kw["effort"])
+    argv += ["--output-format", "json", "--cwd", kw["cwd"]]
     if kw["auto_approve"]:
         argv.append("--always-approve")
     return Launch("grok", argv, kw["cwd"], kw["env"], kw["prompt_file"])
@@ -185,15 +182,10 @@ def _claude(**kw) -> Launch:
     argv = [kw["binary"]]
     if kw["session_id"]:
         argv += ["--resume", kw["session_id"]]
-    argv += [
-        "-p",
-        "--model",
-        kw["model"],
-        "--effort",
-        kw["effort"],
-        "--output-format",
-        "json",
-    ]
+    argv += ["-p"]
+    argv += _flag("--model", kw["model"])
+    argv += _flag("--effort", kw["effort"])
+    argv += ["--output-format", "json"]
     if kw["auto_approve"]:
         argv.append("--dangerously-skip-permissions")
     return Launch("claude", argv, kw["cwd"], kw["env"], kw["prompt_file"], stdin=kw["prompt"])
@@ -206,16 +198,10 @@ def _agy_argv(kw: dict, prompt: str) -> list[str]:
     argv = [kw["binary"]]
     if kw["session_id"]:
         argv += ["--conversation", kw["session_id"]]
-    argv += [
-        "-p",
-        prompt,
-        "--model",
-        kw["model"],
-        "--effort",
-        kw["effort"],
-        "--output-format",
-        "json",
-    ]
+    argv += ["-p", prompt]
+    argv += _flag("--model", kw["model"])
+    argv += _flag("--effort", kw["effort"])
+    argv += ["--output-format", "json"]
     if kw["auto_approve"]:
         argv.append("--dangerously-skip-permissions")
     return argv
@@ -238,12 +224,8 @@ def _gemini(**kw) -> Launch:
         argv = [kw["binary"]]
         if kw["session_id"]:
             argv += ["--resume", kw["session_id"]]
-        argv += [
-            "-m",
-            kw["model"],
-            "-o",
-            "json",
-        ]
+        argv += _flag("-m", kw["model"])
+        argv += ["-o", "json"]
         if kw["auto_approve"]:
             argv.append("-y")
         stdin = kw["prompt"]
@@ -256,12 +238,9 @@ def _codex(**kw) -> Launch:
     argv = [kw["binary"], "exec"]
     if kw["session_id"]:
         argv += ["resume", kw["session_id"]]
-    argv += [
-        "-m",
-        kw["model"],
-        "-c",
-        f"model_reasoning_effort={kw['effort']}",
-    ]
+    argv += _flag("-m", kw["model"])
+    if kw["effort"]:
+        argv += ["-c", f"model_reasoning_effort={kw['effort']}"]
     # No -C: the working directory comes from Launch.cwd (and `codex exec resume` rejects -C).
     argv += [
         "--skip-git-repo-check",

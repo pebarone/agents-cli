@@ -9,6 +9,8 @@ from pathlib import Path
 from unittest import mock
 
 from agents_cli.bus import (
+    bind_external_session,
+    find_conversation_for_session,
     add_participant,
     append_message,
     conversation_dir,
@@ -313,6 +315,43 @@ class SessionAndLauncherTests(unittest.TestCase):
         self.assertEqual(session_record(disk, "codex"), {})
         self.assertEqual(session_record(disk, "claude")["id"], "sess-c")
         self.assertFalse(forget_session("cforget00001", "codex", "sess-1"))
+
+    def test_bind_external_session_marks_record_and_keeps_others(self):
+        meta = get_or_create_conversation("cext00000001", os.getcwd(), "grok")
+        remember_session(meta, "claude", "sess-c", model="sonnet")
+        disk = bind_external_session("cext00000001", "codex", "sess-x", "Meu Nome")
+        self.assertEqual(
+            session_record(disk, "codex"), {"id": "sess-x", "external": True, "name": "Meu Nome"}
+        )
+        self.assertEqual(session_record(load_conversation("cext00000001"), "claude")["model"], "sonnet")
+        self.assertIn("codex", load_conversation("cext00000001")["participants"])
+
+    def test_bind_external_session_keeps_model_of_same_id_but_drops_other_ids(self):
+        meta = get_or_create_conversation("cext00000002", os.getcwd(), "grok")
+        remember_session(meta, "codex", "sess-x", model="m", effort="low")
+        rec = session_record(bind_external_session("cext00000002", "codex", "sess-x", "N"), "codex")
+        self.assertEqual((rec["model"], rec["effort"], rec["external"]), ("m", "low", True))
+        rec = session_record(bind_external_session("cext00000002", "codex", "sess-y", "N2"), "codex")
+        self.assertEqual(rec, {"id": "sess-y", "external": True, "name": "N2"})
+
+    def test_bind_external_session_needs_the_conversation(self):
+        with self.assertRaises(FileNotFoundError):
+            bind_external_session("cnone0000001", "codex", "sess-x")
+
+    def test_find_conversation_for_session_returns_newest(self):
+        old = get_or_create_conversation("cfind0000001", os.getcwd(), "grok")
+        remember_session(old, "codex", "sess-1")
+        new = get_or_create_conversation("cfind0000002", os.getcwd(), "grok")
+        remember_session(new, "codex", "sess-1")
+        other = get_or_create_conversation("cfind0000003", os.getcwd(), "grok")
+        remember_session(other, "claude", "sess-1")
+        meta_path = conversation_dir("cfind0000002") / "meta.json"
+        data = json.loads(meta_path.read_text(encoding="utf-8"))
+        data["created_at"] = "2099-01-01T00:00:00Z"
+        meta_path.write_text(json.dumps(data), encoding="utf-8")
+        self.assertEqual(find_conversation_for_session("codex", "sess-1")["id"], "cfind0000002")
+        self.assertEqual(find_conversation_for_session("claude", "sess-1")["id"], "cfind0000003")
+        self.assertIsNone(find_conversation_for_session("codex", "nope"))
 
     def test_queued_job_with_dead_launcher_is_stale_immediately(self):
         job = create_job({"agent": "codex", "status": "queued", "launcher_pid": dead_pid()})

@@ -345,6 +345,38 @@ def remember_session(
     return meta
 
 
+def bind_external_session(cid: str, agent: str, session_id: str, name: str | None = None) -> dict:
+    """Bind a harness session the user already had (not created by the bus) to `cid`.
+    Marks it `external` so a failed resume is reported instead of replaced by a fresh session.
+    Re-reads meta under the lock; keeps model/effort when the record already holds this id."""
+    meta_path = _meta_path(cid)
+    with file_lock(meta_path):
+        disk = load_json(meta_path, None)
+        if not isinstance(disk, dict) or not disk:
+            raise FileNotFoundError(f"conversa nao encontrada: {cid}")
+        rec = session_record(disk, agent)
+        if rec.get("id") != session_id:
+            rec = {}
+        rec["id"] = session_id
+        rec["external"] = True
+        if name:
+            rec["name"] = name
+        sessions = dict(disk.get("sessions") or {})
+        sessions[agent] = rec
+        disk["sessions"] = sessions
+        _merge_participant(disk, agent)
+        write_json(meta_path, disk)
+        return disk
+
+
+def find_conversation_for_session(agent: str, session_id: str) -> dict | None:
+    """Newest conversation whose `agent` session is `session_id`, or None."""
+    for meta in reversed(list_conversations()):
+        if session_record(meta, agent).get("id") == session_id:
+            return meta
+    return None
+
+
 def forget_session(cid: str, agent: str, session_id: str) -> bool:
     """Drop `agent`'s session record, only if it still holds `session_id`.
     Returns True when a record was removed."""

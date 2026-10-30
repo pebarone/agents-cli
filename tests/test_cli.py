@@ -1,5 +1,6 @@
 import io
 import json
+import sqlite3
 import argparse
 import os
 import subprocess
@@ -7,7 +8,7 @@ import sys
 import tempfile
 import threading
 import unittest
-from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, closing, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from unittest import mock
@@ -15,6 +16,7 @@ from unittest import mock
 from agents_cli.bus import job_dir as job_dir_path
 from agents_cli.bus import (
     append_message,
+    bind_external_session,
     create_job,
     get_or_create_conversation,
     list_jobs,
@@ -575,6 +577,30 @@ class ResumeFallbackTests(BusEnvCase):
         self.assertEqual(run.call_count, 1)
         self.assertEqual(json.loads(out)["text"], "fine")
 
+    def test_external_session_answering_in_another_session_fails_and_keeps_record(self):
+        # agy exits 0 and answers in another conversation, with no warning: the user's session is not swapped.
+        bind_external_session(self.cid, "gemini", "e1e7-mine", "Conversa do agy")
+        other = json.dumps({"conversation_id": "e1e7-other", "status": "SUCCESS", "response": "no context"})
+        run = mock.Mock(side_effect=[completed(0, other, "")])
+        with mock.patch("agents_cli.cli.which", return_value="agy.exe"), mock.patch(
+            "agents_cli.harness.which", return_value="agy.exe"
+        ), mock.patch("agents_cli.cli.run_launch", run):
+            code, out, err = run_main(
+                ["delegate", "gemini", "--conversation", self.cid, "--json", "--prompt", "second question"]
+            )
+        self.assertEqual(code, 1, err)
+        self.assertEqual(run.call_count, 1)
+        data = json.loads(out)
+        expected = (
+            'a sessao "Conversa do agy" (e1e7-mine) nao pode ser retomada pelo gemini: '
+            "o harness respondeu em outra sessao (e1e7-other)"
+        )
+        self.assertEqual((data["status"], data["error"]), ("error", expected))
+        self.assertIn(f"erro: {expected}", err)
+        self.assertEqual(load_job(data["job"])["status"], "error")
+        record = session_record(load_conversation(self.cid), "gemini")
+        self.assertEqual(record, {"id": "e1e7-mine", "external": True, "name": "Conversa do agy"})
+
     def test_codex_failure_detail_prefers_stream_error(self):
         stream = "\n".join(
             [
@@ -946,3 +972,296 @@ class ReportingTests(BusEnvCase):
         self.assertNotIn("codex chrome:", out)
         self.assertIn("  warn     extension: nao achei", out)
         self.assertIn("  fail     host: quebrado", out)
+
+
+def _uid(n):
+    return f"{n:08x}-0000-4000-8000-000000000000"
+
+
+def _codex_stream(thread_id, text="resposta"):
+    return "\n".join(
+        [
+            json.dumps({"type": "thread.started", "thread_id": thread_id}),
+            json.dumps({"type": "item.completed", "item": {"id": "i1", "type": "agent_message", "text": text}}),
+            json.dumps({"type": "turn.completed", "usage": {}}),
+        ]
+    )
+
+
+class SessionCommandsTests(BusEnvCase):
+    """`agents sessions` / `agents resume` against a fixture Codex store (never the real one)."""
+
+    SID_A, SID_B, SID_C, SID_D, SID_E, SID_F = (_uid(n) for n in range(1, 7))
+    NAME_A = "Revisão Fiscal"
+
+    def setUp(self):
+        super().setUp()
+        self.store = tempfile.TemporaryDirectory()
+        self.addCleanup(self.store.cleanup)
+        home = Path(self.store.name)
+        self.proj = home / "proj"
+        self.proj.mkdir()
+        db_path = home / ".codex" / "state_5.sqlite"
+        db_path.parent.mkdir(parents=True)
+
+        def rollout(sid):
+            path = home / ".codex" / "sessions" / f"rollout-2026-10-01T00-00-00-{sid}.jsonl"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("{}\n", encoding="utf-8")
+            return "\\\\?\\" + str(path)
+
+        rows = [
+            (self.SID_A, self.NAME_A, "\\\\?\\" + str(self.proj), rollout(self.SID_A), 0, 6_000_000),
+            (self.SID_B, "Sem Historico", str(self.proj), None, 0, 5_000_000),
+            (self.SID_C, "Pasta Sumida", str(home / "gone"), rollout(self.SID_C), 0, 4_000_000),
+            (self.SID_D, "Arquivada Antiga", str(self.proj), rollout(self.SID_D), 1, 3_000_000),
+            (self.SID_E, "Gemea", str(self.proj), rollout(self.SID_E), 0, 2_000_000),
+            (self.SID_F, "Gemea", str(self.proj), rollout(self.SID_F), 0, 1_000_000),
+        ]
+        with closing(sqlite3.connect(db_path)) as conn:
+            conn.execute(
+                "CREATE TABLE threads (id TEXT PRIMARY KEY, name TEXT, title TEXT, first_user_message TEXT, "
+                "preview TEXT, cwd TEXT, updated_at_ms INTEGER, updated_at INTEGER, archived INTEGER, "
+                "rollout_path TEXT, source TEXT, thread_source TEXT)"
+            )
+            for sid, name, cwd, path, archived, stamp in rows:
+                conn.execute(
+                    "INSERT INTO threads (id, name, cwd, rollout_path, archived, updated_at_ms, thread_source) "
+                    "VALUES (?, ?, ?, ?, ?, ?, 'user')",
+                    (sid, name, cwd, path, archived, stamp * 1000),
+                )
+            conn.commit()
+        patcher = mock.patch("agents_cli.harness_sessions._home", return_value=home)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    # --- sessions
+
+    def test_sessions_human_output(self):
+        code, out, err = run_main(["sessions", "codex"])
+        self.assertEqual(code, 0, err)
+        lines = out.splitlines()
+        self.assertEqual(len(lines), 5)  # the archived one is hidden
+        self.assertRegex(lines[0], rf"^\d{{4}}-\d{{2}}-\d{{2}} \d{{2}}:\d{{2}}  {self.SID_A[:8]}  {self.NAME_A}  ")
+        self.assertTrue(lines[0].endswith(str(self.proj)))
+        self.assertNotIn("\\\\?\\", out)
+        self.assertIn("Sem Historico", lines[1])
+        self.assertIn("[nao retomavel:", lines[1])
+        self.assertNotIn("Arquivada Antiga", out)
+
+    def test_sessions_all_marks_archived(self):
+        code, out, _ = run_main(["sessions", "codex", "--all"])
+        self.assertEqual(code, 0)
+        archived = [line for line in out.splitlines() if "Arquivada Antiga" in line]
+        self.assertEqual(len(archived), 1)
+        self.assertTrue(archived[0].endswith(" [arquivada]"))
+
+    def test_sessions_filter_and_limit(self):
+        code, out, _ = run_main(["sessions", "codex", "revisao", "fiscal"])
+        self.assertEqual(code, 0)
+        self.assertEqual(len(out.splitlines()), 1)
+        code, out, _ = run_main(["sessions", "codex", self.SID_B[:8]])
+        self.assertIn("Sem Historico", out)
+        code, out, _ = run_main(["sessions", "codex", "--limit", "2"])
+        self.assertEqual(len(out.splitlines()), 2)
+        code, out, _ = run_main(["sessions", "codex", "nada-disso"])
+        self.assertEqual((code, out.strip()), (0, "nenhuma sessao"))
+
+    def test_sessions_json_has_full_ids(self):
+        code, out, _ = run_main(["sessions", "codex", "--json", "--limit", "2"])
+        self.assertEqual(code, 0)
+        data = json.loads(out)
+        self.assertEqual([row["id"] for row in data], [self.SID_A, self.SID_B])
+        self.assertEqual(data[0]["name"], self.NAME_A)
+        self.assertEqual(data[0]["cwd"], str(self.proj))
+        self.assertTrue(data[0]["resumable"])
+        self.assertFalse(data[1]["resumable"])
+        self.assertIn("rollout", data[1]["note"])
+
+    def test_sessions_gemini_cli_is_refused(self):
+        with mock.patch("agents_cli.harness.which", return_value="C:\\npm\\gemini.CMD"):
+            code, _, err = run_main(["sessions", "gemini"])
+        self.assertEqual(code, 2)
+        self.assertIn("erro: o Gemini CLI nao permite retomar sessao por id; use o agy", err)
+
+    # --- resume without a prompt
+
+    def test_resume_without_prompt_binds_external_conversation(self):
+        code, out, err = run_main(["resume", "codex", self.NAME_A])
+        self.assertEqual(code, 0, err)
+        cid = out.strip()
+        self.assertRegex(cid, r"^c[0-9a-f]{12}$")
+        meta = load_conversation(cid)
+        self.assertEqual(session_record(meta, "codex"), {"id": self.SID_A, "external": True, "name": self.NAME_A})
+        self.assertEqual(meta["cwd"], str(self.proj.resolve()))
+        self.assertIn(
+            f'[agents] conversation={cid} sessao={self.SID_A} nome="{self.NAME_A}" cwd={self.proj.resolve()}', err
+        )
+        self.assertIn(f'continue com: agents delegate codex --conversation {cid} --prompt "..."', err)
+        self.assertEqual(list_jobs(), [])
+
+    def test_resume_ignores_the_literal_session_word_and_joins_the_name(self):
+        code, out, err = run_main(["resume", "session", "codex", "revisao", "fiscal"])
+        self.assertEqual(code, 0, err)
+        code2, out2, _ = run_main(["resume", "sessao", "codex", self.SID_A[:8], "--json"])
+        self.assertEqual(code2, 0)
+        data = json.loads(out2)
+        self.assertEqual(data["conversation"], out.strip())
+        self.assertEqual((data["agent"], data["session"], data["name"]), ("codex", self.SID_A, self.NAME_A))
+        self.assertEqual(data["cwd"], str(self.proj.resolve()))
+
+    def test_second_resume_reuses_the_conversation(self):
+        _, first, _ = run_main(["resume", "codex", self.NAME_A])
+        _, second, _ = run_main(["resume", "codex", self.NAME_A])
+        self.assertEqual(first, second)
+        self.assertEqual(len(cli_mod.list_conversations()), 1)
+
+    # --- resume errors
+
+    def test_resume_non_resumable_exits_2(self):
+        code, out, err = run_main(["resume", "codex", "Sem Historico"])
+        self.assertEqual(code, 2)
+        self.assertEqual(out, "")
+        self.assertIn('erro: a sessao "Sem Historico" nao pode ser retomada: ', err)
+        self.assertIn("rollout", err)
+        self.assertEqual(cli_mod.list_conversations(), [])
+
+    def test_resume_missing_cwd_exits_2(self):
+        code, _, err = run_main(["resume", "codex", "Pasta Sumida"])
+        self.assertEqual(code, 2)
+        self.assertIn("erro: a pasta da sessao nao existe mais: ", err)
+        self.assertIn("; passe --cwd", err)
+        code, out, err = run_main(["resume", "codex", "Pasta Sumida", "--cwd", str(self.proj)])
+        self.assertEqual(code, 0, err)
+
+    def test_resume_ambiguous_and_not_found(self):
+        code, _, err = run_main(["resume", "codex", "gemea"])
+        self.assertEqual(code, 2)
+        self.assertIn("passe o id", err)
+        self.assertIn(self.SID_E[:8], err)
+        self.assertIn(self.SID_F[:8], err)
+        code, _, err = run_main(["resume", "codex", "nao existe"])
+        self.assertEqual(code, 2)
+        self.assertIn("agents sessions codex", err)
+
+    def test_resume_needs_agent_and_name(self):
+        code, _, err = run_main(["resume", "codex"])
+        self.assertEqual(code, 2)
+        self.assertIn("uso: agents resume", err)
+
+    # --- resume with a prompt
+
+    def run_resume(self, argv, outcomes=None):
+        run = mock.Mock(side_effect=outcomes or [completed(0, _codex_stream(self.SID_A), "")])
+        with mock.patch("agents_cli.cli.which", return_value="codex"), mock.patch(
+            "agents_cli.harness.which", return_value="codex"
+        ), mock.patch("agents_cli.cli.run_launch", run):
+            result = run_main(argv)
+        return run, result
+
+    def test_resume_with_prompt_resumes_the_session_without_model_flags(self):
+        run, (code, out, err) = self.run_resume(["resume", "codex", self.NAME_A, "--prompt", "continue", "--json"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(run.call_count, 1)
+        launch = run.call_args.args[0]
+        self.assertEqual(launch.argv[1:4], ["exec", "resume", self.SID_A])
+        self.assertEqual(launch.cwd, str(self.proj.resolve()))
+        self.assertNotIn("-m", launch.argv)
+        self.assertFalse([a for a in launch.argv if a.startswith("model_reasoning_effort")])
+        self.assertIn("model: (da sessao)", launch.stdin)
+        self.assertIn(f"resume: {self.SID_A}", launch.stdin)
+        self.assertTrue(launch.stdin.rstrip().endswith("continue"))
+        self.assertIn("model=(da sessao) effort=(da sessao)", err)
+        self.assertIn("resumed=yes", err)
+        data = json.loads(out)
+        self.assertEqual((data["status"], data["text"], data["resumed"]), ("ok", "resposta", True))
+        self.assertIsNone(data["model"])
+        record = session_record(load_conversation(data["conversation"]), "codex")
+        self.assertEqual((record["id"], record["external"], record["name"]), (self.SID_A, True, self.NAME_A))
+        self.assertNotIn("model", record)
+
+    def test_resume_follow_ups_keep_the_same_conversation_and_session(self):
+        run, (_, out1, _) = self.run_resume(["resume", "codex", self.NAME_A, "--prompt", "um", "--json"])
+        cid = json.loads(out1)["conversation"]
+        run, (code, out2, err) = self.run_resume(["resume", "codex", self.NAME_A, "--prompt", "dois", "--json"])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out2)["conversation"], cid)
+        self.assertIn(self.SID_A, run.call_args.args[0].argv)
+
+    def test_resume_passes_explicit_model_effort_and_prompt_file(self):
+        prompt_file = Path(self.store.name) / "p.txt"
+        prompt_file.write_text("texto do arquivo", encoding="utf-8")
+        run, (code, _, err) = self.run_resume(
+            ["resume", "codex", self.NAME_A, "--prompt-file", str(prompt_file), "--model", "gpt-x", "--effort", "low"]
+        )
+        self.assertEqual(code, 0, err)
+        launch = run.call_args.args[0]
+        self.assertEqual(launch.argv[launch.argv.index("-m") + 1], "gpt-x")
+        self.assertIn("model_reasoning_effort=low", launch.argv)
+        self.assertIn("texto do arquivo", launch.stdin)
+
+    def test_resume_cwd_option_overrides_the_session_cwd(self):
+        other = Path(self.store.name) / "outra"
+        other.mkdir()
+        run, (code, _, err) = self.run_resume(["resume", "codex", self.NAME_A, "--prompt", "x", "--cwd", str(other)])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(run.call_args.args[0].cwd, str(other.resolve()))
+
+    def test_delegate_resume_slash_form_routes_to_resume(self):
+        run, (code, out, err) = self.run_resume(
+            ["delegate", "resume", "session", "codex", self.NAME_A, "--prompt", "x", "--json"]
+        )
+        self.assertEqual(code, 0, err)
+        self.assertIn(self.SID_A, run.call_args.args[0].argv)
+        self.assertEqual(json.loads(out)["status"], "ok")
+        code, out, _ = run_main(["delegate", "sessions", "codex", "--json"])
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(out)[0]["id"], self.SID_A)
+
+    def test_resume_docs_pass_the_message_with_prompt(self):
+        root = Path(__file__).resolve().parents[1]
+        skill = (root / "skill" / "delegate" / "SKILL.md").read_text(encoding="utf-8")
+        readme = (root / "README.md").read_text(encoding="utf-8")
+        self.assertIn('resume <agent> "<name>" --prompt "<message>"', skill)
+        self.assertIn('resume <agente> "<nome>" --prompt "<mensagem>"', readme)
+        self.assertIn("~/.codex/sessions", readme)
+        self.assertIn("nao retomavel", readme)
+
+    def test_external_resume_failure_does_not_fall_back_to_a_fresh_session(self):
+        run, (code, out, err) = self.run_resume(
+            ["resume", "codex", self.NAME_A, "--prompt", "x", "--json"], outcomes=[completed(1, "", RESUME_ERROR)]
+        )
+        self.assertEqual(code, 1)
+        self.assertEqual(run.call_count, 1)
+        data = json.loads(out)
+        self.assertEqual(data["status"], "error")
+        expected = f'a sessao "{self.NAME_A}" ({self.SID_A}) nao pode ser retomada pelo codex: Error: thread/resume'
+        self.assertIn(expected, data["error"])
+        self.assertIn(f"erro: {expected}", err)
+        self.assertNotIn("abrindo sessao nova", err)
+        job = load_job(data["job"])
+        self.assertEqual(job["status"], "error")
+        self.assertNotIn("resume_failed", job)
+        record = session_record(load_conversation(data["conversation"]), "codex")
+        self.assertEqual((record["id"], record["external"]), (self.SID_A, True))
+
+    def test_external_session_in_use_by_another_job_fails_instead_of_starting_fresh(self):
+        _, out, _ = run_main(["resume", "codex", self.NAME_A])
+        cid = out.strip()
+        busy = create_job({"agent": "codex", "conversation": cid, "status": "running", "pid": os.getpid()})
+        run, (code, _, err) = self.run_resume(["resume", "codex", self.NAME_A, "--prompt", "x"])
+        self.assertEqual(code, 2)
+        self.assertIn(f'erro: a sessao "{self.NAME_A}" ja esta em uso por outro job ({busy["id"]})', err)
+        run.assert_not_called()
+
+    def test_plain_delegate_to_external_session_keeps_model_unset(self):
+        _, out, _ = run_main(["resume", "codex", self.NAME_A])
+        cid = out.strip()
+        code, out, _ = run_main(
+            ["delegate", "codex", "--conversation", cid, "--cwd", str(self.proj), "--dry-run", "--json", "--prompt", "oi"]
+        )
+        self.assertEqual(code, 0)
+        data = json.loads(out)
+        self.assertEqual(data["resume"], self.SID_A)
+        self.assertIsNone(data["model"])
+        self.assertNotIn("-m", data["argv"])
