@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from collections.abc import Iterable
@@ -51,22 +52,26 @@ FILE_EXTENSIONS = frozenset(
 )
 
 
-def _looks_like_file(token: str) -> bool:
+def _looks_like_file(token: str, cwd: str | None = None) -> bool:
     if Path(token).suffix.lower() in FILE_EXTENSIONS:
         return True
     try:
-        return Path(token).exists()
+        return (Path(cwd or os.getcwd()) / token).exists()
     except (OSError, ValueError):
         return False
 
 
-def looks_like_model(token: str, known: Iterable[str] = ()) -> bool:
-    """Heuristic for free-text tasks: is this first word a model name, not prose or a file?"""
+def looks_like_model(token: str, known: Iterable[str] = (), cwd: str | None = None) -> bool:
+    """Heuristic for free-text tasks: is this first word a model name, not prose or a file?
+    It needs a letter (so `3` is not a model) and either a digit, one of `./:`, a known
+    name or a configured model (so `corrija-o` is prose). File names in `cwd` are not models."""
     if not MODEL_SHAPE.fullmatch(token):
         return False
-    if _looks_like_file(token):
+    if not any(ch.isalpha() for ch in token):
         return False
-    if any(ch.isdigit() or ch in "-./:" for ch in token):
+    if _looks_like_file(token, cwd):
+        return False
+    if any(ch.isdigit() or ch in "./:" for ch in token):
         return True
     lowered = token.lower()
     if lowered in KNOWN_MODEL_NAMES:
@@ -93,10 +98,12 @@ def parse_tokens(
     tokens: list[str],
     prompt_given: bool = False,
     known_models: Iterable[str] = (),
+    cwd: str | None = None,
 ) -> DelegateRequest:
     """`prompt_given`: the prompt comes from --prompt/--prompt-file, so the first
     non-effort token is always the model. Otherwise it is only a model when it
-    looks like one (see looks_like_model)."""
+    looks like one (see looks_like_model). `cwd` is where file names are looked up
+    (default: the current directory)."""
     if not tokens:
         raise ParseError("falta o nome do agente")
     agent = normalize_agent(tokens[0])
@@ -108,7 +115,7 @@ def parse_tokens(
         effort = normalize_effort(rest[i])
         i += 1
     elif i < len(rest) and not rest[i].startswith("-"):
-        is_model = prompt_given or looks_like_model(rest[i], known_models)
+        is_model = prompt_given or looks_like_model(rest[i], known_models, cwd)
         if is_model:
             model = rest[i]
             i += 1

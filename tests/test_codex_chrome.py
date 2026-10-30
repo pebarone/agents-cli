@@ -165,6 +165,18 @@ class SessionStorageTests(unittest.TestCase):
         self.assertIn("no rollout found", row["detail"])
         self.assertIn("Monte o drive ou aponte para uma pasta local", row["detail"])
 
+    def test_link_target_strips_extended_prefixes(self):
+        cases = {
+            "\\\\?\\UNC\\server\\share\\codex": "\\\\server\\share\\codex",
+            "\\\\?\\D:\\dados\\sessions": "D:\\dados\\sessions",
+            "C:\\local\\sessions": "C:\\local\\sessions",
+        }
+        for raw, expected in cases.items():
+            with mock.patch.object(codex_chrome.os.path, "islink", return_value=True), mock.patch.object(
+                codex_chrome.os, "readlink", return_value=raw
+            ):
+                self.assertEqual(codex_chrome._link_target(Path("sessions")), expected, raw)
+
     def test_never_raises(self):
         with mock.patch.object(codex_chrome.Path, "home", side_effect=RuntimeError("boom")):
             rows = codex_chrome.diagnose()

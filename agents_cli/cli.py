@@ -326,12 +326,25 @@ def cmd_delegate(args) -> int:
         if not child_job:
             raise
         try:
-            job = load_job(child_job) or {}
+            job = load_job(child_job)
+        except FileNotFoundError:
+            # No meta for this id: do not create a ghost job just to record the error.
+            print(f"erro: {exc}; o job {child_job} nao existe, nada a finalizar", file=sys.stderr)
+            return 2
         except (OSError, RuntimeError, ValueError):
             job = {}
         job = {**job, "id": child_job}
         code = 4 if isinstance(exc, _DepthError) else 2
-        return _fail(args, job, args.from_agent or "unknown", "error", code, str(exc), f"erro: {exc}")
+        return _fail(
+            args,
+            job,
+            args.from_agent or "unknown",
+            "error",
+            code,
+            str(exc),
+            f"erro: {exc}",
+            only_if_status=("queued",),
+        )
     if isinstance(prepared, int):
         return prepared
     return _run_delegate(args, config, *prepared)
@@ -465,10 +478,14 @@ def _run_delegate(args, config, request, conversation, job, session_id, from_age
             (job_dir(jid) / "stderr.txt").write_text(stderr, encoding="utf-8")
             text, session = extract_text(request.agent, stdout, launch.last_message_file, stderr=stderr)
             failed = completed.returncode != 0 or output_is_error(stdout, agent=request.agent)
-            if not failed:
+            # agy answers a missing conversation by silently opening a new one (exit 0),
+            # so a resumed run that came back on another session also counts as lost.
+            switched = not failed and bool(session) and session != session_id
+            if not failed and not switched:
                 break
             if session_id and not retried and resume_missing(request.agent, stdout, stderr, text):
                 retried = True
+                _keep_first_attempt(jid)
                 print(
                     f"[agents] aviso: sessao {session_id} do {request.agent} nao existe mais; "
                     "abrindo sessao nova com historico",
@@ -480,9 +497,14 @@ def _run_delegate(args, config, request, conversation, job, session_id, from_age
                 launch = build(None)
                 _announce(cid, jid, None, request.model, request.effort)
                 continue
-            detail = (failure_text(request.agent, stdout, stderr) or text or stderr or stdout)[-4000:]
+            if not failed:
+                break
+            detail =(failure_text(request.agent, stdout, stderr) or text or stderr or stdout)[-4000:]
             return _fail(args, job, from_agent, "error", completed.returncode or 1, detail, detail)
-        remember_session(conversation, request.agent, session, request.model, request.effort)
+        try:
+            remember_session(conversation, request.agent, session, request.model, request.effort)
+        except (OSError, RuntimeError) as exc:
+            print(f"[agents] aviso: nao consegui gravar a sessao: {exc}", file=sys.stderr)
         update_job(
             jid,
             {
@@ -545,18 +567,45 @@ def _run_delegate(args, config, request, conversation, job, session_id, from_age
 
 
 
-def _fail(args, job: dict, from_agent: str, status: str, returncode: int, message: str, stderr_text) -> int:
-    """Finish a job as failed: job meta, conversation message, stderr, optional JSON."""
+def _keep_first_attempt(jid: str) -> None:
+    """Move the failed first attempt's output aside so the retry writes its own."""
+    folder = job_dir(jid)
+    for name in ("stdout", "stderr"):
+        try:
+            (folder / f"{name}.txt").replace(folder / f"{name}.attempt1.txt")
+        except OSError as exc:
+            print(f"[agents] aviso: nao consegui guardar {name} da 1a tentativa: {exc}", file=sys.stderr)
+
+
+def _fail(
+    args,
+    job: dict,
+    from_agent: str,
+    status: str,
+    returncode: int,
+    message: str,
+    stderr_text,
+    only_if_status: tuple[str, ...] | None = None,
+) -> int:
+    """Finish a job as failed: job meta, conversation message, stderr, optional JSON.
+    With `only_if_status`, a job already in another state is left untouched."""
     jid = job["id"]
     cid = job.get("conversation")
     message = message or status
     try:
-        update_job(
+        updated = update_job(
             jid,
             {"status": status, "returncode": returncode, "error": message[-4000:], "finished_at": now_iso()},
+            only_if_status=only_if_status,
         )
     except (OSError, RuntimeError, ValueError) as exc:
         print(f"[agents] aviso: nao atualizei o job {jid}: {exc}", file=sys.stderr)
+        updated = {}
+    if updated is None:
+        # Another process claimed or finished this job; its conversation is not ours to write.
+        if stderr_text:
+            print(stderr_text, file=sys.stderr)
+        return returncode
     try:
         append_message(
             cid,
@@ -978,6 +1027,7 @@ def _resolve_request(args, config, require_binary: bool = True, fill_defaults: b
         [args.agent, *args.rest],
         prompt_given=bool(prompt),
         known_models=known,
+        cwd=getattr(args, "cwd", None),
     )
     if prompt is None:
         prompt = parsed.prompt

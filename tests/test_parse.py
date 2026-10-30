@@ -94,3 +94,24 @@ class ParseTests(unittest.TestCase):
         self.assertEqual((req.model, req.effort, req.prompt), ("whatever", "high", ""))
         req = parse_tokens(["codex", "high"], prompt_given=True)
         self.assertEqual((req.model, req.effort), (None, "high"))
+
+    def test_hyphenated_word_is_prose_not_model(self):
+        req = parse_tokens(["claude", "corrija-o", "agora"])
+        self.assertEqual((req.model, req.prompt), (None, "corrija-o agora"))
+        req = parse_slash("/delegate claude corrija-o agora")
+        self.assertEqual((req.model, req.prompt), (None, "corrija-o agora"))
+
+    def test_bare_number_is_not_a_model(self):
+        req = parse_tokens(["codex", "3", "testes", "falhando"])
+        self.assertEqual((req.model, req.prompt), (None, "3 testes falhando"))
+
+    def test_names_with_digits_dots_or_known_names_are_models(self):
+        for name in ("gpt-6.1-sol", "grok-4.6", "gemini-3.8-flash", "sonnet", "haiku-5.5"):
+            req = parse_tokens(["codex", name, "go"])
+            self.assertEqual((req.model, req.prompt), (name, "go"), name)
+
+    def test_file_lookup_uses_given_cwd(self):
+        with tempfile.TemporaryDirectory() as here, tempfile.TemporaryDirectory() as other:
+            open(os.path.join(here, "foo-1"), "w").close()
+            self.assertIsNone(parse_tokens(["codex", "foo-1", "go"], cwd=here).model)
+            self.assertEqual(parse_tokens(["codex", "foo-1", "go"], cwd=other).model, "foo-1")

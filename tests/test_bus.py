@@ -6,6 +6,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from agents_cli.bus import (
     add_participant,
@@ -38,6 +39,15 @@ def dead_pid() -> int:
     proc = subprocess.Popen([sys.executable, "-c", "pass"])
     proc.wait()
     return proc.pid
+
+
+STARTED = "2026-10-30T12:00:00Z"
+STARTED_EPOCH = 1793361600  # calendar.timegm of STARTED
+
+
+def filetime(epoch: float) -> int:
+    """Windows FILETIME ticks for a Unix epoch (what process_creation_time returns)."""
+    return int((epoch + 11644473600) * 10_000_000)
 
 
 class BusTests(unittest.TestCase):
@@ -249,6 +259,38 @@ class BusTests(unittest.TestCase):
         job = create_job({"agent": "codex", "status": "ok"})
         self.assertIsNone(update_job(job["id"], {"status": "error"}, only_if_status=("running",)))
         self.assertEqual(load_job(job["id"])["status"], "ok")
+
+    def test_reused_pid_is_not_the_running_job(self):
+        create_job(
+            {"id": "jreuse", "agent": "claude", "conversation": "c1", "status": "running",
+             "started_at": STARTED, "pid": os.getpid()}
+        )
+        job = load_job("jreuse")
+        with mock.patch("agents_cli.bus.process_creation_time", return_value=filetime(STARTED_EPOCH + 60)):
+            self.assertTrue(job_is_stale(job))
+            self.assertEqual(running_jobs("c1", "claude"), [])
+        with mock.patch("agents_cli.bus.process_creation_time", return_value=filetime(STARTED_EPOCH + 3)):
+            self.assertFalse(job_is_stale(job))
+            self.assertEqual([j["id"] for j in running_jobs("c1", "claude")], ["jreuse"])
+        with mock.patch("agents_cli.bus.process_creation_time", return_value=filetime(STARTED_EPOCH - 600)):
+            self.assertFalse(job_is_stale(job))
+        with mock.patch("agents_cli.bus.process_creation_time", return_value=None):
+            self.assertFalse(job_is_stale(job))
+
+    def test_pid_reuse_check_needs_started_at(self):
+        create_job({"id": "jnostart", "agent": "claude", "conversation": "c1", "status": "running", "pid": os.getpid()})
+        with mock.patch("agents_cli.bus.process_creation_time", return_value=filetime(STARTED_EPOCH + 60)) as created:
+            self.assertFalse(job_is_stale(load_job("jnostart")))
+        created.assert_not_called()
+
+    def test_running_jobs_reads_only_its_conversation_newest_first(self):
+        create_job({"id": "jmine", "agent": "claude", "conversation": "cmine0000001", "status": "running", "pid": os.getpid()})
+        create_job({"id": "jtheirs", "agent": "claude", "conversation": "cother000001", "status": "running", "pid": os.getpid()})
+        create_job({"id": "jlatest", "agent": "claude", "conversation": "cmine0000001", "status": "running", "pid": os.getpid()})
+        with mock.patch("agents_cli.bus.load_job", wraps=load_job) as loader:
+            rows = running_jobs("cmine0000001", "claude")
+        self.assertEqual([j["id"] for j in rows], ["jlatest", "jmine"])
+        self.assertEqual(sorted(c.args[0] for c in loader.call_args_list), ["jlatest", "jmine"])
 
 
 class SessionAndLauncherTests(unittest.TestCase):

@@ -12,12 +12,15 @@ from pathlib import Path
 from agents_cli import PROTOCOL
 from agents_cli.home import bus_dir
 from agents_cli.parse import ParseError
-from agents_cli.procs import pid_alive
+from agents_cli.procs import pid_alive, process_creation_time
 
 ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 LOCK_TIMEOUT_SEC = 10.0
 QUEUED_GRACE_SEC = 30
 LIVE_STATUSES = ("queued", "running")
+PID_REUSE_SLACK_SEC = 5
+FILETIME_EPOCH_OFFSET_SEC = 11644473600  # Windows FILETIME ticks start in 1601; Unix epoch is 1970
+JOB_INDEX_NAME = "jobs.jsonl"
 
 
 def _now() -> str:
@@ -369,7 +372,24 @@ def create_job(payload: dict) -> dict:
     payload.setdefault("status", "queued")
     payload.setdefault("created_at", _now())
     write_json(job_dir(jid) / "meta.json", payload)
+    if payload.get("conversation"):
+        _index_job(payload["conversation"], jid)
     return payload
+
+
+def _index_job(cid: str, jid: str) -> None:
+    """Append the job id to its conversation's index, which running_jobs reads."""
+    path = conversation_dir(cid) / JOB_INDEX_NAME
+    with file_lock(path):
+        _append_jsonl(path, {"job": jid})
+
+
+def _conversation_job_ids(cid: str) -> list[str]:
+    """Job ids of a conversation, oldest first."""
+    path = conversation_dir(cid, create=False) / JOB_INDEX_NAME
+    if not path.is_file():
+        return []
+    return [row["job"] for row in _read_jsonl(path) if isinstance(row.get("job"), str)]
 
 
 def save_job(payload: dict) -> None:
@@ -404,10 +424,23 @@ def job_age_sec(job: dict, now: float | None = None) -> float | None:
     return max(0.0, (now if now is not None else time.time()) - stamp)
 
 
+def _job_pid_alive(job: dict) -> bool:
+    """The job's recorded process is alive. A pid whose process was created well after the
+    job started was reused by another process, so it is not the job's any more."""
+    if not pid_alive(job.get("pid")):
+        return False
+    started = parse_ts(job.get("started_at"))
+    created = process_creation_time(job["pid"]) if started is not None else None
+    if started is None or created is None:
+        return True
+    created_epoch = created / 10_000_000 - FILETIME_EPOCH_OFFSET_SEC
+    return created_epoch <= started + PID_REUSE_SLACK_SEC
+
+
 def job_is_stale(job: dict, now: float | None = None) -> bool:
     """A live-looking job whose process is gone."""
     status = job.get("status")
-    if status not in LIVE_STATUSES or pid_alive(job.get("pid")):
+    if status not in LIVE_STATUSES or _job_pid_alive(job):
         return False
     if status == "queued":
         launcher = job.get("launcher_pid")
@@ -469,15 +502,23 @@ def list_jobs() -> list[dict]:
 
 
 def running_jobs(conversation: str, agent: str, exclude: str | None = None) -> list[dict]:
-    return [
-        job
-        for job in list_jobs()
-        if job.get("conversation") == conversation
-        and job.get("agent") == agent
-        and job.get("status") == "running"
-        and job.get("id") != exclude
-        and pid_alive(job.get("pid"))
-    ]
+    """Live jobs of `agent` in `conversation`, newest first. Reads only that conversation's jobs."""
+    rows = []
+    for jid in reversed(_conversation_job_ids(conversation)):
+        if jid == exclude:
+            continue
+        try:
+            job = load_job(jid)
+        except FileNotFoundError:
+            continue
+        if (
+            job.get("conversation") == conversation
+            and job.get("agent") == agent
+            and job.get("status") == "running"
+            and _job_pid_alive(job)
+        ):
+            rows.append(job)
+    return rows
 
 
 # --- inbox ------------------------------------------------------------------

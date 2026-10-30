@@ -344,13 +344,20 @@ RESUME_MISSING_PATTERNS = (
     "could not find session",
     "invalid session",
     "thread not found",
+    # grok: 'Session "<id>" not found locally' / 'Failed to restore session from remote'
+    "failed to restore session",
 )
+# grok 'Session "<id>" not found', agy 'warning: conversation "<id>" not found'
+_RESUME_MISSING_RE = re.compile(r'(?:session|conversation)\s+"?[\w.:-]+"?\s+not found', re.IGNORECASE)
 
 
 def resume_missing(agent: str, stdout: str | None, stderr: str | None, text: str | None = None) -> bool:
-    """True when a failed resume was rejected because the harness no longer has that session."""
-    blob = "\n".join(part for part in (stdout, stderr, text) if part).lower()
-    return any(pattern in blob for pattern in RESUME_MISSING_PATTERNS)
+    """True when a failed resume was rejected because the harness no longer has that session.
+
+    Only error channels count: stderr and the agent's error event (see failure_text).
+    The model's free text (`text`) and plain stdout never trigger the fallback."""
+    blob = "\n".join(part for part in (stderr, failure_text(agent, stdout or "", stderr)) if part).lower()
+    return any(pattern in blob for pattern in RESUME_MISSING_PATTERNS) or bool(_RESUME_MISSING_RE.search(blob))
 
 
 def _json_events(raw: str) -> list[dict]:
@@ -532,6 +539,9 @@ def _last_json_object(raw: str) -> dict | None:
 
 
 def run_launch(launch: Launch, timeout: int) -> subprocess.CompletedProcess:
+    if launch.last_message_file is not None:
+        # An answer file left by an earlier attempt must never be read as this run's text.
+        launch.last_message_file.unlink(missing_ok=True)
     popen_kwargs: dict = {}
     if os.name != "nt":
         popen_kwargs["start_new_session"] = True

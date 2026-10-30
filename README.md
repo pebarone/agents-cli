@@ -47,7 +47,7 @@ Forma slash, dentro de uma sessao que ja carregou a skill:
 
 O agente que le o `/delegate` deve **rodar** `agents delegate ...`, nao fingir a resposta do outro.
 
-Texto livre (sem `--prompt`) funciona quando a primeira palavra nao parece um modelo nem um arquivo: `delegate codex fix the bug` manda "fix the bug" com o modelo padrao. Palavras como `gpt-6.1-sol`, `sonnet` ou `x/y` viram modelo; nomes de arquivo (`README.md`, `main.py`, algo que existe na pasta atual) nao. Na duvida, prefira `--prompt`/`--prompt-file` (nesse caso o primeiro argumento solto sempre e o modelo).
+Texto livre (sem `--prompt`) funciona quando a primeira palavra nao parece um modelo nem um arquivo: `delegate codex fix the bug` manda "fix the bug" com o modelo padrao. Palavras como `gpt-6.1-sol`, `sonnet` ou `x/y` viram modelo; palavras so com letras e hifen (`corrija-o`), numero puro (`3`) e nomes de arquivo (`README.md`, `main.py`, algo que existe na pasta do `--cwd` ou na atual) nao. Na duvida, prefira `--prompt`/`--prompt-file` (nesse caso o primeiro argumento solto sempre e o modelo).
 
 Prompts longos: `--prompt-file caminho.txt` (evita problema de aspas).
 

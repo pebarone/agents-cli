@@ -356,10 +356,30 @@ class HarnessTests(unittest.TestCase):
             "Thread not found",
         ):
             self.assertTrue(resume_missing("claude", "", phrase, ""), phrase)
-        self.assertTrue(resume_missing("grok", phrase, "", ""))
-        self.assertTrue(resume_missing("grok", "", "", "...No Rollout Found..."))
+        self.assertTrue(resume_missing("grok", "", "No Rollout Found", ""))
+        grok_error = (
+            'Session "00000000-0000-4000-8000-000000000000" not found locally, restoring conversation from remote...\n'
+            "Error: Failed to restore session from remote: fetching session record: session get failed: 404 Not Found"
+        )
+        self.assertTrue(resume_missing("grok", "", grok_error, ""))
+        self.assertTrue(resume_missing("grok", "", 'Session "abc-1" not found locally', ""))
         self.assertFalse(resume_missing("codex", "", "rate limited", "boom"))
         self.assertFalse(resume_missing("codex", None, None, None))
+
+    def test_resume_missing_ignores_phrase_in_plain_stdout_or_text(self):
+        self.assertFalse(resume_missing("grok", "session not found", "", ""))
+        self.assertFalse(resume_missing("claude", "Session not found", "", ""))
+        self.assertFalse(resume_missing("grok", "", "", "...No Rollout Found..."))
+        self.assertFalse(resume_missing("codex", "task: check if no rollout found", "", "session not found"))
+        message = json.dumps({"type": "item.completed", "item": {"type": "agent_message", "text": "no rollout found"}})
+        self.assertFalse(resume_missing("codex", message, "", ""))
+
+    def test_resume_missing_reads_codex_error_events(self):
+        error = json.dumps({"type": "error", "message": "no rollout found for thread id x"})
+        self.assertTrue(resume_missing("codex", error, "", ""))
+        failed = json.dumps({"type": "turn.failed", "error": {"message": "Thread not found"}})
+        self.assertTrue(resume_missing("codex", failed, "", ""))
+        self.assertFalse(resume_missing("claude", error, "", ""))
 
 
 class RunLaunchTests(unittest.TestCase):
@@ -411,6 +431,24 @@ class RunLaunchTests(unittest.TestCase):
         result = run_launch(launch, timeout=30)
         self.assertEqual(result.stdout.strip(), "ok")
         self.assertEqual(result.returncode, 0)
+
+    def test_stale_last_message_is_removed_before_the_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            last = Path(tmp) / "last_message.txt"
+            last.write_text("stale answer", encoding="utf-8")
+            # Exit 0 only if the file is already gone when the process starts.
+            script = "import os, sys; sys.exit(1 if os.path.exists(sys.argv[1]) else 0)"
+            launch = self._launch([sys.executable, "-c", script, str(last)])
+            launch.last_message_file = last
+            result = run_launch(launch, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse(last.exists())
+
+    def test_missing_last_message_file_is_fine(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            launch = self._launch([sys.executable, "-c", "print('ok')"])
+            launch.last_message_file = Path(tmp) / "absent.txt"
+            self.assertEqual(run_launch(launch, timeout=30).returncode, 0)
 
     def test_real_stdin_roundtrip(self):
         launch = self._launch([sys.executable, "-c", "import sys; print(sys.stdin.read().upper())"], stdin="abc")

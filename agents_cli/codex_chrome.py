@@ -75,6 +75,8 @@ def _link_target(path: Path) -> str | None:
         target = os.readlink(path)
     except OSError:
         return "?"
+    if target.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + target[len("\\\\?\\UNC\\") :]
     return target[4:] if target.startswith("\\\\?\\") else target
 
 

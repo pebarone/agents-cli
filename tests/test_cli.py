@@ -8,6 +8,7 @@ import tempfile
 import threading
 import unittest
 from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -27,6 +28,7 @@ from agents_cli.bus import (
 from agents_cli import cli as cli_mod
 from agents_cli.cli import _plan_and_claim, main, spawn_detached
 from agents_cli.harness import Launch
+from agents_cli.harness import run_launch as real_run_launch
 from agents_cli.home import cli_command, prepend_bin_dirs
 from agents_cli.install import _norm, skill_destinations, skill_source, unix_wrapper_body, wrapper_body
 
@@ -240,6 +242,17 @@ class LifecycleTests(BusEnvCase):
         meta = load_conversation(data["conversation"])
         self.assertEqual(session_record(meta, "claude")["id"], "sess-1")
 
+    def test_session_save_failure_keeps_the_answer(self):
+        with harness(mock.Mock(return_value=completed(0, "out"))), mock.patch(
+            "agents_cli.cli.remember_session", side_effect=RuntimeError("nao consegui o lock de meta.json")
+        ):
+            code, out, err = run_main(["delegate", "claude", "--json", "--prompt", "do it"])
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertEqual((data["status"], data["text"]), ("ok", "hello"))
+        self.assertEqual(load_job(data["job"])["status"], "ok")
+        self.assertIn("[agents] aviso: nao consegui gravar a sessao: nao consegui o lock de meta.json", err)
+
     def test_timeout_marks_job_and_appends_error_message(self):
         run = mock.Mock(side_effect=subprocess.TimeoutExpired(["fake"], 1))
         with harness(run):
@@ -351,6 +364,15 @@ class LifecycleTests(BusEnvCase):
         data = json.loads(out)
         self.assertNotEqual(data["model"], "fix")
         self.assertIn("fix the bug", Path(data["prompt_file"]).read_text(encoding="utf-8"))
+
+    def test_file_in_delegate_cwd_is_not_taken_as_model(self):
+        with tempfile.TemporaryDirectory() as folder:
+            open(os.path.join(folder, "foo-1"), "w").close()
+            code, out, _ = run_main(["delegate", "codex", "foo-1", "go", "--cwd", folder, "--dry-run", "--json"])
+        self.assertEqual(code, 0)
+        data = json.loads(out)
+        self.assertNotEqual(data["model"], "foo-1")
+        self.assertIn("foo-1 go", Path(data["prompt_file"]).read_text(encoding="utf-8"))
 
 
 class AtomicClaimTests(BusEnvCase):
@@ -473,6 +495,37 @@ class ResumeFallbackTests(BusEnvCase):
         self.assertEqual(json.loads(out)["status"], "error")
         self.assertIsNone(session_record(load_conversation(self.cid), "codex").get("id"))
 
+    def test_retry_keeps_first_attempt_output_and_never_reads_its_answer_file(self):
+        def fake_codex(launch, timeout):
+            # Stand-in for codex run through the real run_launch: the failed resume leaves an
+            # answer file behind; the fresh retry answers on stdout only.
+            if "resume" in launch.argv:
+                script = (
+                    "import sys; sys.stdin.read(); "
+                    "open(sys.argv[1], 'w', encoding='utf-8').write('stale answer'); "
+                    f"sys.stderr.write({RESUME_ERROR!r}); sys.exit(1)"
+                )
+                argv = [sys.executable, "-c", script, str(launch.last_message_file)]
+            else:
+                script = f"import sys; sys.stdin.read(); sys.stdout.write({CODEX_OK_STREAM!r})"
+                argv = [sys.executable, "-c", script]
+            return real_run_launch(replace(launch, argv=argv), timeout)
+
+        with mock.patch("agents_cli.cli.which", return_value="codex"), mock.patch(
+            "agents_cli.harness.which", return_value="codex"
+        ), mock.patch("agents_cli.cli.run_launch", side_effect=fake_codex):
+            code, out, err = run_main(
+                ["delegate", "codex", "--conversation", self.cid, "--json", "--prompt", "second question"]
+            )
+        self.assertEqual(code, 0, err)
+        data = json.loads(out)
+        self.assertEqual(data["text"], "fresh answer")
+        folder = job_dir_path(data["job"])
+        self.assertEqual((folder / "stderr.attempt1.txt").read_text(encoding="utf-8"), RESUME_ERROR)
+        self.assertEqual((folder / "stdout.attempt1.txt").read_text(encoding="utf-8"), "")
+        self.assertEqual((folder / "stderr.txt").read_text(encoding="utf-8"), "")
+        self.assertEqual((folder / "stdout.txt").read_text(encoding="utf-8"), CODEX_OK_STREAM)
+
     def test_other_failures_do_not_retry_or_forget_session(self):
         run, (code, out, err) = self.run_codex([completed(1, "", "Error: rate limited")])
         self.assertEqual(code, 1)
@@ -483,6 +536,44 @@ class ResumeFallbackTests(BusEnvCase):
         run, (code, _, _) = self.run_codex([completed(1, "", RESUME_ERROR)], extra=("--no-resume",))
         self.assertEqual(code, 1)
         self.assertEqual(run.call_count, 1)
+
+    def run_resumed(self, agent, binary, old, outcomes):
+        meta = load_conversation(self.cid)
+        remember_session(meta, agent, old, model="m-1", effort="high")
+        run = mock.Mock(side_effect=outcomes)
+        with mock.patch("agents_cli.cli.which", return_value=binary), mock.patch(
+            "agents_cli.harness.which", return_value=binary
+        ), mock.patch("agents_cli.cli.run_launch", run):
+            result = run_main(["delegate", agent, "--conversation", self.cid, "--json", "--prompt", "second question"])
+        return run, result
+
+    def test_agy_silently_opening_new_conversation_retries_with_history(self):
+        # agy exits 0 on a missing conversation: it only warns and answers on a new, empty one.
+        old = "00000000-0000-4000-8000-000000000000"
+        lost = json.dumps({"conversation_id": "e1e7-lost", "status": "SUCCESS", "response": "no context"})
+        fresh = json.dumps({"conversation_id": "e1e7-fresh", "status": "SUCCESS", "response": "with history"})
+        run, (code, out, err) = self.run_resumed(
+            "gemini",
+            "agy.exe",
+            old,
+            [completed(0, lost, f'warning: conversation "{old}" not found\n'), completed(0, fresh, "")],
+        )
+        self.assertEqual(code, 0, err)
+        self.assertEqual(run.call_count, 2)
+        second = run.call_args_list[1].args[0]
+        self.assertNotIn("--conversation", second.argv)
+        self.assertIn("first question", " ".join(second.argv))
+        data = json.loads(out)
+        self.assertEqual(data["text"], "with history")
+        self.assertEqual(session_record(load_conversation(self.cid), "gemini")["id"], "e1e7-fresh")
+
+    def test_resume_returning_another_session_id_without_warning_is_kept(self):
+        old = "11111111-1111-4111-8111-111111111111"
+        ok = json.dumps({"result": "fine", "session_id": "22222222-2222-4222-8222-222222222222"})
+        run, (code, out, err) = self.run_resumed("claude", "claude.exe", old, [completed(0, ok, "")])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(run.call_count, 1)
+        self.assertEqual(json.loads(out)["text"], "fine")
 
     def test_codex_failure_detail_prefers_stream_error(self):
         stream = "\n".join(
@@ -648,6 +739,26 @@ class BackgroundTests(BusEnvCase):
         self.assertEqual(job["status"], "error")
         self.assertIn("nao encontrado", job["error"])
         self.assertEqual(read_messages(job["conversation"])[-1]["kind"], "error")
+
+    def test_child_with_unknown_job_creates_no_ghost_job(self):
+        jid = "jghost000001"
+        cid = get_or_create_conversation("cghost000001", os.getcwd(), "grok")["id"]
+        with mock.patch("agents_cli.cli.which", return_value="fake"):
+            code, _, err = run_main(["delegate", "claude", "--job", jid, "--conversation", cid])
+        self.assertEqual(code, 2)
+        self.assertIn(f"o job {jid} nao existe, nada a finalizar", err)
+        self.assertFalse((job_dir_path(jid, create=False) / "meta.json").exists())
+        self.assertEqual(list_jobs(), [])
+
+    def test_child_setup_failure_leaves_a_job_that_moved_on(self):
+        child_args, jid = self._queue_child()
+        update_job(jid, {"status": "running", "pid": os.getpid()})
+        with mock.patch("agents_cli.cli.which", return_value=None):
+            code, _, _ = run_main(child_args)
+        self.assertEqual(code, 2)
+        job = load_job(jid)
+        self.assertEqual((job["status"], job["pid"]), ("running", os.getpid()))
+        self.assertEqual([m["kind"] for m in read_messages(job["conversation"])], ["delegate"])
 
     def test_child_depth_overflow_finalizes_job(self):
         child_args, jid = self._queue_child()
