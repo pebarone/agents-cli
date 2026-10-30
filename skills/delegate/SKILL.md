@@ -16,15 +16,22 @@ You are one of several local agents. Each one runs in its own native harness.
 You talk to the others through this CLI. Do not role-play the other harness.
 Spawn it.
 
-Canonical command (cmd, PowerShell, **and Git Bash**):
+## Setup
+
+Run `agents --version`. If the command is not found, tell the user this skill
+needs the `agents` CLI (Python 3.11+). With their OK, install it:
 
 ```text
-python -u C:\Users\augus\Desktop\agents_cli\agents.py
+uv tool install git+https://github.com/pebarone/agents-cli
 ```
 
-Call that. Do **not** gate on `command -v agents` or `which agents`. On
-Windows, Claude's Bash tool does not see `agents.cmd` (Codex/cmd does, via
-PATHEXT). If `agents` works, it is only a shorthand.
+Alternative: `pipx install git+https://github.com/pebarone/agents-cli`. If it
+installed but the shell still does not find it, run `uv tool update-shell` (or
+`pipx ensurepath`) and reopen the terminal. Then run `agents doctor` to check
+which harnesses are on the PATH. Never role-play the other agent when the CLI
+is missing.
+
+## Usage
 
 ```
 /delegate [agent] [model] [effort] [task]
@@ -52,7 +59,7 @@ How:
 1. First hop of a task — no `--conversation`:
 
 ```text
-python -u C:\Users\augus\Desktop\agents_cli\agents.py delegate <agent> <model> <effort> --prompt "<task>"
+agents delegate <agent> <model> <effort> --prompt "<task>"
 ```
 
 2. Read `conversation=` from the `[agents]` line on stderr (or from `--json`).
@@ -62,7 +69,7 @@ python -u C:\Users\augus\Desktop\agents_cli\agents.py delegate <agent> <model> <
    model/effort:
 
 ```text
-python -u C:\Users\augus\Desktop\agents_cli\agents.py delegate <agent> --conversation <id> --prompt "<next message>"
+agents delegate <agent> --conversation <id> --prompt "<next message>"
 ```
 
 4. Different task — do **not** pass `--conversation`. If you were yourself
@@ -70,7 +77,7 @@ python -u C:\Users\augus\Desktop\agents_cli\agents.py delegate <agent> --convers
    you do not inherit the parent thread:
 
 ```text
-python -u C:\Users\augus\Desktop\agents_cli\agents.py delegate <agent> <model> <effort> --new --prompt "<other task>"
+agents delegate <agent> <model> <effort> --new --prompt "<other task>"
 ```
 
 Do not `--no-resume` on a follow-up. Do not paste the previous reply back
@@ -103,8 +110,8 @@ after the agent are part of the name, so never append the message as loose words
 Run (never answer as that agent yourself):
 
 ```text
-python -u C:\Users\augus\Desktop\agents_cli\agents.py resume <agent> "<name>" --prompt "<message>"
-python -u C:\Users\augus\Desktop\agents_cli\agents.py sessions <agent> [filter]
+agents resume <agent> "<name>" --prompt "<message>"
+agents sessions <agent> [filter]
 ```
 
 - `sessions` lists the harness's sessions, newest first (`--limit N`, `--all`
@@ -131,8 +138,8 @@ python -u C:\Users\augus\Desktop\agents_cli\agents.py sessions <agent> [filter]
 ## Fan out (background + wait)
 
 ```text
-python -u C:\Users\augus\Desktop\agents_cli\agents.py delegate <agent> --background --new --prompt "<task>"   # prints a job id
-python -u C:\Users\augus\Desktop\agents_cli\agents.py wait <job> [<job> ...] [--timeout SEC] [--json]
+agents delegate <agent> --background --new --prompt "<task>"   # prints a job id
+agents wait <job> [<job> ...] [--timeout SEC] [--json]
 ```
 
 Start several, then `wait` on all. One job prints its text; several print
@@ -147,10 +154,10 @@ failed, 3 if the wait timed out. A job whose process died becomes `error`.
    long. Then run **one** of:
 
 ```text
-python -u C:\Users\augus\Desktop\agents_cli\agents.py delegate <agent> <model> <effort> --prompt "<task>"
-python -u C:\Users\augus\Desktop\agents_cli\agents.py delegate <agent> --conversation <id> --prompt "<follow-up>"
-python -u C:\Users\augus\Desktop\agents_cli\agents.py delegate <agent> <model> <effort> --new --prompt "<other task>"
-python -u C:\Users\augus\Desktop\agents_cli\agents.py delegate <agent> <model> <effort> --prompt-file <path>
+agents delegate <agent> <model> <effort> --prompt "<task>"
+agents delegate <agent> --conversation <id> --prompt "<follow-up>"
+agents delegate <agent> <model> <effort> --new --prompt "<other task>"
+agents delegate <agent> <model> <effort> --prompt-file <path>
 ```
 
 3. The command blocks until the other harness prints its reply. Show that
@@ -167,24 +174,24 @@ Talk to the other side of a thread from outside a hop (not to answer the agent
 waiting on you); use `--prompt=<text>` if the text starts with `-`:
 
 ```text
-python -u C:\Users\augus\Desktop\agents_cli\agents.py reply --conversation <id> --prompt "<message>"
+agents reply --conversation <id> --prompt "<message>"
 ```
 
 Mailbox (do not wait):
 
 ```text
-python -u C:\Users\augus\Desktop\agents_cli\agents.py send <agent> --prompt "<message>"
-python -u C:\Users\augus\Desktop\agents_cli\agents.py inbox --agent <you>
+agents send <agent> --prompt "<message>"
+agents inbox --agent <you>
 ```
 
 Status:
 
 ```text
-python -u C:\Users\augus\Desktop\agents_cli\agents.py list
-python -u C:\Users\augus\Desktop\agents_cli\agents.py doctor
-python -u C:\Users\augus\Desktop\agents_cli\agents.py status
-python -u C:\Users\augus\Desktop\agents_cli\agents.py log
-python -u C:\Users\augus\Desktop\agents_cli\agents.py log <conversation> --tail 5
+agents list
+agents doctor
+agents status
+agents log
+agents log <conversation> --tail 5
 ```
 
 `status` shows the latest 10 conversations and jobs (`stale` = the process
@@ -198,8 +205,7 @@ never changes the exit code).
 - `codex`, `claude`, `grok` launch their own CLIs. Never route them through a proxy.
 - Nested `/delegate` is allowed. Stop when `agents` says the depth limit was hit.
 - Do not delegate to yourself.
-- Do not ask the user to copy-paste between terminals. Run the python launcher.
-- Do not run `install` just because `command -v agents` failed in Bash.
+- Do not ask the user to copy-paste between terminals. Run `agents`.
 - Auto-approve is on for delegated runs so the other harness can work unattended.
   The user already has each CLI logged in.
 

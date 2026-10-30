@@ -9,7 +9,7 @@ Este diretorio e o codigo do `agents`. Os harnesses (Codex, Gemini/Antigravity, 
 `/delegate [agent] [model] [effort] [tarefa]` vira `agents delegate ...`.
 A CLI dispara o harness nativo em modo print, grava a conversa em `%USERPROFILE%\.agents\bus` e devolve a resposta.
 
-A skill compartilhada e `skill/delegate/SKILL.md`. `agents install` cria junctions dessa pasta em:
+A skill compartilhada e `skills/delegate/SKILL.md`. `agents install` cria junctions dessa pasta em:
 
 - `~/.agents/skills/delegate`
 - `~/.claude/skills/delegate`
@@ -35,7 +35,7 @@ Nao copie a skill. Edite o original e reinstale se o junction quebrar.
 | O que | Onde |
 | --- | --- |
 | CLI | `agents.py`, `agents_cli/` |
-| Skill | `skill/delegate/SKILL.md` |
+| Skill | `skills/delegate/SKILL.md` |
 | Bus | `~/.agents/bus` |
 | Config | `~/.agents/config.json` |
 | Wrapper | `~/.local/bin/agents.cmd` |

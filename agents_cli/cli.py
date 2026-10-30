@@ -57,7 +57,7 @@ from agents_cli.harness_sessions import (
     list_sessions,
     matches_filter,
 )
-from agents_cli.home import launcher_path
+from agents_cli.home import is_checkout, launcher_path
 from agents_cli.install import doctor_links, install, uninstall
 from agents_cli.parse import ParseError, normalize_agent, parse_tokens
 from agents_cli.prompt import SESSION_VALUE, render_history, wrap_prompt
@@ -237,15 +237,21 @@ def cmd_doctor(_args) -> int:
             ok = False
         print(f"  {row.agent:8} {mark:8} {row.path or '-'}")
     print("skill /delegate:")
-    for row in doctor_links():
+    packaged = not is_checkout()
+    skill_rows = doctor_links()
+    for row in skill_rows:
         if row["exists"] and row["linked"]:
             mark = "ok"
         elif row["exists"]:
             mark = "present"
+        elif packaged:
+            mark = "-"
         else:
             mark = "MISSING"
             ok = False
         print(f"  {mark:8} {row['path']}")
+    if packaged and not any(row["exists"] for row in skill_rows):
+        print("  instale a skill com: npx skills add pebarone/agents-cli -g")
     print(f"whoami: {whoami()}")
     # Informational only: never changes the exit code.
     try:
@@ -261,6 +267,9 @@ def cmd_doctor(_args) -> int:
 
 def cmd_install(_args) -> int:
     result = install()
+    if result.get("hint"):
+        print(result["hint"])
+        return 0
     print(f"skill: {result['skill']}")
     for row in result["skills"]:
         print(f"  {row['action']:8} {row['path']}")
@@ -272,6 +281,9 @@ def cmd_install(_args) -> int:
 
 def cmd_uninstall(_args) -> int:
     result = uninstall()
+    if result.get("hint"):
+        print(result["hint"])
+        return 0
     if not result["removed"]:
         print("nada para remover")
         return 0
@@ -771,10 +783,11 @@ def _delegate_background(args, request, cid: str, from_agent: str, cwd: str, dep
 def background_argv(
     args, request, cid: str, jid: str, from_agent: str, cwd: str, timeout: int, prompt_file: Path
 ) -> list[str]:
+    entry = [str(launcher_path())] if is_checkout() else ["-P", "-m", "agents_cli"]
     argv = [
         sys.executable,
         "-u",
-        str(launcher_path()),
+        *entry,
         "delegate",
         request.agent,
         "--job",

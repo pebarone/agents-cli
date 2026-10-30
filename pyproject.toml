@@ -1,3 +1,7 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "agents-cli"
 version = "0.2.0"
@@ -7,6 +11,9 @@ readme = "README.md"
 
 [project.scripts]
 agents = "agents_cli.cli:main"
+
+[project.urls]
+Repository = "https://github.com/pebarone/agents-cli"
 
 [tool.setuptools.packages.find]
 include = ["agents_cli*"]

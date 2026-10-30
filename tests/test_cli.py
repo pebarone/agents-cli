@@ -3,6 +3,7 @@ import json
 import sqlite3
 import argparse
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -31,8 +32,19 @@ from agents_cli import cli as cli_mod
 from agents_cli.cli import _plan_and_claim, main, spawn_detached
 from agents_cli.harness import Launch
 from agents_cli.harness import run_launch as real_run_launch
-from agents_cli.home import cli_command, prepend_bin_dirs
-from agents_cli.install import _norm, skill_destinations, skill_source, unix_wrapper_body, wrapper_body
+from agents_cli.home import cli_command, is_checkout, prepend_bin_dirs
+from agents_cli.install import (
+    _norm,
+    _present,
+    doctor_links,
+    install,
+    link_skill,
+    skill_destinations,
+    skill_source,
+    uninstall,
+    unix_wrapper_body,
+    wrapper_body,
+)
 
 
 def run_main(argv):
@@ -174,9 +186,205 @@ class CliTests(unittest.TestCase):
         self.assertTrue(first.lower().endswith(os.path.join(".local", "bin").lower()) or ".local" in first.lower())
 
     def test_norm_strips_extended_path(self):
-        left = Path(r"\\?\C:\Users\augus\Desktop\agents_cli\skill\delegate")
-        right = Path(r"C:\Users\augus\Desktop\agents_cli\skill\delegate")
+        left = Path(r"\\?\C:\repo\skills\delegate")
+        right = Path(r"C:\repo\skills\delegate")
         self.assertEqual(_norm(left), _norm(right))
+
+
+class PackageModeTests(unittest.TestCase):
+    """CLI instalado como pacote (sem agents.py ao lado) versus checkout de desenvolvimento."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+        self.stack.enter_context(mock.patch.dict(os.environ, {"AGENTS_HOME": str(self.root / "agents-home")}))
+        self.dests = [self.root / "skills" / "one" / "delegate", self.root / "skills" / "two" / "delegate"]
+        self.wrappers = [self.root / "bin" / "agents"]
+        self.stack.enter_context(mock.patch("agents_cli.install.skill_destinations", return_value=self.dests))
+        self.stack.enter_context(mock.patch("agents_cli.install.wrapper_destinations", return_value=self.wrappers))
+        self.stack.enter_context(mock.patch("agents_cli.cli.probe", return_value=[]))
+        self.stack.enter_context(mock.patch("agents_cli.cli.codex_chrome.diagnose", return_value=[]))
+
+    def use_repo(self, checkout):
+        repo = self.root / "repo"
+        repo.mkdir()
+        if checkout:
+            (repo / "agents.py").write_text("", encoding="utf-8")
+        self.stack.enter_context(mock.patch("agents_cli.home.repo_root", return_value=repo))
+        return repo
+
+    def add_skill(self, dest):
+        dest.mkdir(parents=True)
+        (dest / "SKILL.md").write_text("---\nname: delegate\n---\n", encoding="utf-8")
+
+    def background_argv(self):
+        args = argparse.Namespace(approve="auto", new=False, no_resume=False, no_history=False)
+        request = argparse.Namespace(agent="claude", model=None, effort=None)
+        return cli_mod.background_argv(args, request, "c1", "j1", "grok", "C:/repo", 60, self.root / "request.txt")
+
+    def test_is_checkout_follows_the_launcher(self):
+        repo = self.use_repo(checkout=False)
+        self.assertFalse(is_checkout())
+        (repo / "agents.py").write_text("", encoding="utf-8")
+        self.assertTrue(is_checkout())
+
+    def test_package_cli_command_prefers_agents_on_path(self):
+        self.use_repo(checkout=False)
+        with mock.patch("agents_cli.home.shutil.which", return_value="C:/bin/agents.exe"):
+            self.assertEqual(cli_command(), "agents")
+
+    def test_package_cli_command_is_unquoted_when_python_path_has_no_spaces(self):
+        self.use_repo(checkout=False)
+        with mock.patch("agents_cli.home.shutil.which", return_value=None), mock.patch.object(
+            sys, "executable", "C:\\Python311\\python.exe"
+        ):
+            cmd = cli_command()
+        self.assertEqual(cmd, "C:\\Python311\\python.exe -u -m agents_cli")
+        self.assertFalse(cmd.startswith('"'))
+
+    def test_package_cli_command_quotes_python_path_with_spaces(self):
+        self.use_repo(checkout=False)
+        with mock.patch("agents_cli.home.shutil.which", return_value=None), mock.patch.object(
+            sys, "executable", "C:\\Program Files\\Python\\python.exe"
+        ):
+            self.assertEqual(cli_command(), '"C:\\Program Files\\Python\\python.exe" -u -m agents_cli')
+
+    def test_checkout_cli_command_keeps_the_launcher(self):
+        repo = self.use_repo(checkout=True)
+        self.assertEqual(cli_command(), f'python -u "{repo / "agents.py"}"')
+
+    def test_package_background_argv_runs_the_module(self):
+        self.use_repo(checkout=False)
+        argv = self.background_argv()
+        self.assertEqual(argv[:5], [sys.executable, "-u", "-P", "-m", "agents_cli"])
+        self.assertEqual(argv[5:7], ["delegate", "claude"])
+
+    def test_checkout_background_argv_keeps_the_launcher(self):
+        repo = self.use_repo(checkout=True)
+        argv = self.background_argv()
+        self.assertEqual(argv[:3], [sys.executable, "-u", str(repo / "agents.py")])
+        self.assertEqual(argv[3:5], ["delegate", "claude"])
+
+    def test_package_install_creates_nothing(self):
+        self.use_repo(checkout=False)
+        result = install()
+        self.assertIsNone(result["skill"])
+        self.assertEqual(result["skills"], [])
+        self.assertEqual(result["wrappers"], [])
+        self.assertIn("npx skills add pebarone/agents-cli -g", result["hint"])
+        for path in self.dests + self.wrappers:
+            self.assertFalse(path.exists(), path)
+
+    def test_package_install_command_prints_hint_and_succeeds(self):
+        self.use_repo(checkout=False)
+        code, out, _ = run_main(["install"])
+        self.assertEqual(code, 0)
+        self.assertIn("npx skills add pebarone/agents-cli -g", out)
+
+    def test_checkout_install_without_skill_still_raises(self):
+        self.use_repo(checkout=True)
+        self.stack.enter_context(mock.patch("agents_cli.install.skill_source", return_value=self.root / "missing"))
+        with self.assertRaises(FileNotFoundError):
+            install()
+
+    def test_package_uninstall_removes_nothing(self):
+        self.use_repo(checkout=False)
+        for dest in self.dests:
+            self.add_skill(dest)
+        for path in self.wrappers:
+            path.parent.mkdir(parents=True)
+            path.write_text("x", encoding="utf-8")
+        result = uninstall()
+        self.assertEqual(result["removed"], [])
+        self.assertIn("npx skills remove delegate -g", result["hint"])
+        for path in self.dests + self.wrappers:
+            self.assertTrue(path.exists(), path)
+
+    def test_package_uninstall_command_points_to_npx_skills(self):
+        self.use_repo(checkout=False)
+        code, out, _ = run_main(["uninstall"])
+        self.assertEqual(code, 0)
+        self.assertIn("npx skills", out)
+
+    def test_package_doctor_links_follow_skill_md(self):
+        self.use_repo(checkout=False)
+        self.add_skill(self.dests[0])
+        rows = doctor_links()
+        self.assertEqual([row["path"] for row in rows], [str(dest) for dest in self.dests])
+        self.assertEqual([(row["exists"], row["linked"]) for row in rows], [(True, True), (False, False)])
+
+    def test_package_doctor_does_not_fail_for_a_missing_skill(self):
+        self.use_repo(checkout=False)
+        self.add_skill(self.dests[0])
+        code, out, _ = run_main(["doctor"])
+        self.assertEqual(code, 0)
+        self.assertNotIn("MISSING", out)
+        line = next(row for row in out.splitlines() if str(self.dests[1]) in row)
+        self.assertTrue(line.strip().startswith("-"), line)
+        self.assertNotIn("npx skills add", out)
+
+    def test_package_doctor_hints_how_to_install_the_skill(self):
+        self.use_repo(checkout=False)
+        code, out, _ = run_main(["doctor"])
+        self.assertEqual(code, 0)
+        self.assertNotIn("MISSING", out)
+        self.assertEqual(out.count("npx skills add pebarone/agents-cli -g"), 1)
+
+    def test_checkout_doctor_still_fails_for_a_missing_skill(self):
+        self.use_repo(checkout=True)
+        code, out, _ = run_main(["doctor"])
+        self.assertEqual(code, 1)
+        self.assertIn("MISSING", out)
+        self.assertNotIn("npx skills", out)
+
+
+@unittest.skipUnless(os.name == "nt", "junction e so no Windows")
+class DanglingJunctionTests(unittest.TestCase):
+    """Junction cujo destino sumiu (skill antiga): tem que contar como existente, ser trocada e ser removida."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        old_source = self.root / "skill" / "delegate"
+        old_source.mkdir(parents=True)
+        (old_source / "SKILL.md").write_text("old", encoding="utf-8")
+        self.source = self.root / "skills" / "delegate"
+        self.source.mkdir(parents=True)
+        (self.source / "SKILL.md").write_text("new", encoding="utf-8")
+        self.dest = self.root / "home" / ".claude" / "skills" / "delegate"
+        self.dest.parent.mkdir(parents=True)
+        subprocess.run(["cmd", "/c", "mklink", "/J", str(self.dest), str(old_source)], check=True, capture_output=True)
+        self.addCleanup(subprocess.run, ["cmd", "/c", "rmdir", str(self.dest)], capture_output=True, check=False)
+        shutil.rmtree(old_source)  # o destino some, como acontece depois de `git mv skill skills`
+        self.stack = ExitStack()
+        self.addCleanup(self.stack.close)
+
+    def patch_checkout(self):
+        self.stack.enter_context(mock.patch("agents_cli.install.is_checkout", return_value=True))
+        self.stack.enter_context(mock.patch("agents_cli.install.skill_source", return_value=self.source))
+        self.stack.enter_context(mock.patch("agents_cli.install.skill_destinations", return_value=[self.dest]))
+        self.stack.enter_context(mock.patch("agents_cli.install.wrapper_destinations", return_value=[]))
+
+    def test_dangling_junction_counts_as_present(self):
+        self.assertTrue(_present(self.dest))
+        self.assertFalse(self.dest.exists())
+
+    def test_link_skill_recreates_it_for_the_new_source(self):
+        self.assertEqual(link_skill(self.dest, self.source), "created")
+        self.assertEqual((self.dest / "SKILL.md").read_text(encoding="utf-8"), "new")
+
+    def test_doctor_links_reports_present_but_not_linked(self):
+        self.patch_checkout()
+        self.assertEqual(doctor_links(), [{"path": str(self.dest), "exists": True, "linked": False}])
+
+    def test_uninstall_removes_the_dangling_junction(self):
+        self.patch_checkout()
+        self.assertEqual(uninstall()["removed"], [str(self.dest)])
+        self.assertFalse(_present(self.dest))
 
 
 def dead_pid() -> int:
@@ -1220,12 +1428,19 @@ class SessionCommandsTests(BusEnvCase):
 
     def test_resume_docs_pass_the_message_with_prompt(self):
         root = Path(__file__).resolve().parents[1]
-        skill = (root / "skill" / "delegate" / "SKILL.md").read_text(encoding="utf-8")
+        skill = (root / "skills" / "delegate" / "SKILL.md").read_text(encoding="utf-8")
         readme = (root / "README.md").read_text(encoding="utf-8")
         self.assertIn('resume <agent> "<name>" --prompt "<message>"', skill)
         self.assertIn('resume <agente> "<nome>" --prompt "<mensagem>"', readme)
         self.assertIn("~/.codex/sessions", readme)
         self.assertIn("nao retomavel", readme)
+
+    def test_skill_is_machine_independent(self):
+        root = Path(__file__).resolve().parents[1]
+        skill = (root / "skills" / "delegate" / "SKILL.md").read_text(encoding="utf-8")
+        self.assertNotIn("C:\\", skill)
+        self.assertNotIn("python -u", skill)
+        self.assertIn("pebarone/agents-cli", skill)
 
     def test_external_resume_failure_does_not_fall_back_to_a_fresh_session(self):
         run, (code, out, err) = self.run_resume(

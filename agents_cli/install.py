@@ -4,14 +4,21 @@ import os
 import subprocess
 from pathlib import Path
 
-from agents_cli.home import agents_home, bin_dirs, launcher_path, repo_root
+from agents_cli.home import agents_home, bin_dirs, is_checkout, launcher_path, repo_root
 
 
 SKILL_NAME = "delegate"
+PACKAGE_INSTALL_HINT = (
+    "CLI instalada como pacote (sem checkout). Instale a skill com: npx skills add pebarone/agents-cli -g"
+)
+PACKAGE_UNINSTALL_HINT = (
+    "CLI instalada como pacote (sem checkout): nada para remover aqui. "
+    "A skill /delegate foi instalada pelo npx skills; remova-a com: npx skills remove delegate -g"
+)
 
 
 def skill_source() -> Path:
-    return repo_root() / "skill" / SKILL_NAME
+    return repo_root() / "skills" / SKILL_NAME
 
 
 def skill_destinations() -> list[Path]:
@@ -54,9 +61,14 @@ def unix_wrapper_body() -> str:
     )
 
 
+def _present(path: Path) -> bool:
+    """True when something is at `path`, including a junction or symlink whose target is gone."""
+    return os.path.lexists(path)
+
+
 def link_skill(dest: Path, source: Path) -> str:
     dest.parent.mkdir(parents=True, exist_ok=True)
-    if dest.exists() or dest.is_symlink():
+    if _present(dest):
         if _same_junction(dest, source):
             return "ok"
         _remove(dest)
@@ -103,7 +115,7 @@ def _remove(path: Path) -> None:
         return
     if os.name == "nt":
         subprocess.run(["cmd", "/c", "rmdir", str(path)], check=False)
-        if path.exists():
+        if _present(path):
             subprocess.run(["cmd", "/c", "rmdir", "/S", "/Q", str(path)], check=False)
         return
     path.rmdir()
@@ -124,6 +136,8 @@ def write_wrapper(path: Path) -> str:
 
 
 def install() -> dict:
+    if not is_checkout():
+        return {"skill": None, "skills": [], "wrappers": [], "hint": PACKAGE_INSTALL_HINT}
     source = skill_source()
     if not (source / "SKILL.md").is_file():
         raise FileNotFoundError(f"skill nao encontrada em {source}")
@@ -139,19 +153,27 @@ def install() -> dict:
 
 
 def uninstall() -> dict:
+    if not is_checkout():
+        return {"removed": [], "hint": PACKAGE_UNINSTALL_HINT}
     removed = []
     for dest in skill_destinations() + wrapper_destinations():
-        if dest.exists() or dest.is_symlink():
+        if _present(dest):
             _remove(dest)
             removed.append(str(dest))
     return {"removed": removed}
 
 
 def doctor_links() -> list[dict]:
+    if not is_checkout():
+        rows = []
+        for dest in skill_destinations():
+            present = (dest / "SKILL.md").is_file()
+            rows.append({"path": str(dest), "exists": present, "linked": present})
+        return rows
     source = skill_source()
     rows = []
     for dest in skill_destinations():
-        exists = dest.exists() or dest.is_symlink()
+        exists = _present(dest)
         rows.append(
             {
                 "path": str(dest),

@@ -8,7 +8,20 @@ Bus local para Codex, Gemini, Claude e Grok conversarem entre si. Cada um contin
 
 ## Instalar
 
+### Uso normal (outra maquina)
+
 ```powershell
+uv tool install git+https://github.com/pebarone/agents-cli
+npx skills add pebarone/agents-cli -g
+agents doctor
+```
+
+Sem uv: `pipx install git+https://github.com/pebarone/agents-cli`. O primeiro comando instala o `agents` (Python 3.11+). O `npx skills add` (CLI `skills`, da vercel-labs) copia so a pasta da skill `/delegate` para os harnesses; para escolher quais, repita `-a` (ex.: `-a claude-code -a codex`). Para remover a skill depois: `npx skills remove delegate -g`. Se o `agents` nao for achado depois de instalar, rode `uv tool update-shell` (ou `pipx ensurepath`) e reabra o terminal. `agents doctor` mostra quais harnesses estao no PATH e onde a skill foi copiada.
+
+### Desenvolvimento (checkout)
+
+```powershell
+git clone https://github.com/pebarone/agents-cli $env:USERPROFILE\Desktop\agents_cli
 cd $env:USERPROFILE\Desktop\agents_cli
 .\install.ps1
 ```
@@ -26,6 +39,8 @@ Confira:
 python agents.py doctor
 python agents.py list
 ```
+
+> Nao misture os dois modos na mesma maquina. `agents install` cria junctions apontando para o checkout, e o `npx skills add` escreveria pelos mesmos caminhos (atraves dos junctions). Escolha um.
 
 ## Uso
 
