@@ -172,3 +172,7 @@ python -m unittest discover -s tests -v
 ## O que isto nao e
 
 Nao e o Mix do Codex (proxy de modelos). Aqui cada conversa entra no app/CLI de verdade daquele agente.
+
+## Licenca
+
+MIT. Veja [LICENSE](LICENSE).

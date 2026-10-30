@@ -7,6 +7,7 @@ name = "agents-cli"
 version = "0.2.0"
 description = "Bus for local Codex, Gemini, Claude and Grok harnesses to send messages to each other."
 requires-python = ">=3.11"
+license = { text = "MIT" }
 readme = "README.md"
 
 [project.scripts]
